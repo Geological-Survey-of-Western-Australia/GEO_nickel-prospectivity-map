@@ -15,11 +15,9 @@ variables:
     value: $[contains(variables['Build.SourceBranch'], 'cicd')]
   - name: MAMBA_ROOT_PREFIX
     value: $(Agent.TempDirectory)/micromamba
-  # Your Artifactory virtual conda repo that has Curation enabled.
-  # Set this in the gswa-jfrog variable group alongside jfrog_url.
+  # Add artifactory_conda_url to your gswa-jfrog variable group.
   # e.g. https://yourorg.jfrog.io/artifactory/api/conda/conda-virtual
-  - name: ARTIFACTORY_CONDA_URL
-    value: $(artifactory_conda_url)
+  # Do NOT redeclare it here — that causes a cyclic reference error.
 
 pool:
   vmImage: ubuntu-latest
@@ -55,8 +53,6 @@ stages:
     - script: |
         curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
           | tar -xvj bin/micromamba
-        # prependpath takes effect in subsequent steps only, so use the
-        # explicit path here and export for the remainder of this step
         export PATH="$(pwd)/bin:$PATH"
         echo "##vso[task.prependpath]$(pwd)/bin"
         micromamba --version
@@ -64,8 +60,8 @@ stages:
 
     # ------------------------------------------------------------------ #
     # 3. Strip build strings + Windows/ESRI-only packages                 #
-    #    Also rewrites channels to point at Artifactory so that           #
-    #    every package request flows through Curation.                    #
+    #    Rewrites channels to point at Artifactory so every request       #
+    #    flows through Curation.                                           #
     # ------------------------------------------------------------------ #
     - script: |
         python3 - <<'EOF'
@@ -102,48 +98,45 @@ stages:
 
             lines.append(f"{name}={version}" if version else name)
 
-        # Replace channels with the single Artifactory virtual repo.
-        # Curation enforces policy on every request that flows through it;
-        # --override-channels ensures nothing sneaks past to the public internet.
-        artifactory_url = os.environ['ARTIFACTORY_CONDA_URL']
+        # Credentials are embedded in the channel URL so micromamba
+        # authenticates automatically — no separate auth step needed.
+        jfrog_url   = os.environ['JFROG_URL'].rstrip('/')
+        jfrog_user  = os.environ['JFROG_USER']
+        jfrog_token = os.environ['JFROG_TOKEN']
+        conda_repo  = os.environ['ARTIFACTORY_CONDA_REPO']  # just the repo name, e.g. conda-virtual
+
+        # Format: https://user:token@host/artifactory/api/conda/repo-name
+        channel = f"{jfrog_url.replace('https://', f'https://{jfrog_user}:{jfrog_token}@')}/artifactory/api/conda/{conda_repo}"
 
         with open('environment-scan.yml', 'w') as f:
             f.write("name: scan-env\n")
             f.write("channels:\n")
-            f.write(f"  - {artifactory_url}\n")
+            f.write(f"  - {channel}\n")
             f.write("dependencies:\n")
             for line in lines:
                 f.write(f"  - {line}\n")
 
         print(f"Generated environment-scan.yml with {len(lines)} packages")
-        print(f"Channel: {artifactory_url}")
+        print(f"Channel: {jfrog_url}/artifactory/api/conda/{conda_repo}  (credentials redacted)")
         EOF
 
-        echo "--- environment-scan.yml ---"
-        cat environment-scan.yml
+        echo "--- environment-scan.yml (channel redacted) ---"
+        # Print without exposing the token
+        grep -v "https://" environment-scan.yml
+        echo "  - https://***:***@<artifactory>/api/conda/<repo>"
       env:
-        ARTIFACTORY_CONDA_URL: $(ARTIFACTORY_CONDA_URL)
+        JFROG_URL: $(jfrog_url)
+        JFROG_USER: $(jfrog_bot_user)
+        JFROG_TOKEN: $(jfrog_bot_token)
+        ARTIFACTORY_CONDA_REPO: $(artifactory_conda_repo)
       displayName: Strip build strings, rewrite channels to Artifactory
 
     # ------------------------------------------------------------------ #
-    # 4. Configure micromamba auth for Artifactory                        #
-    #    Curation requires authenticated requests to evaluate packages    #
-    #    against your org's policies.                                     #
-    # ------------------------------------------------------------------ #
-    - script: |
-        micromamba auth login \
-          --host "$(jfrog_url)" \
-          --token "$(jfrog_bot_token)"
-      displayName: Authenticate micromamba with Artifactory
-
-    # ------------------------------------------------------------------ #
-    # 5. Install via Artifactory — Curation enforces policy inline        #
+    # 4. Install via Artifactory — Curation enforces policy inline        #
     #                                                                     #
-    #    Any package that violates your Curation policy is blocked at     #
-    #    download time. The install fails immediately with a clear error  #
-    #    message identifying the blocked package and violated policy.     #
-    #    No packages need to be on disk first — enforcement happens at    #
-    #    the proxy layer in Artifactory before bytes are transferred.     #
+    #    Credentials are embedded in the channel URL (step 3).           #
+    #    If a package violates your Curation policy, Artifactory          #
+    #    returns a 403 and micromamba exits non-zero, failing the build.  #
     # ------------------------------------------------------------------ #
     - script: |
         micromamba create \
@@ -154,27 +147,20 @@ stages:
       displayName: Install via Artifactory (Curation enforces policy)
 
     # ------------------------------------------------------------------ #
-    # 6. Curation audit report                                            #
-    #                                                                     #
-    #    jf curation-audit queries the Artifactory audit log for this     #
-    #    run and produces a structured report of blocked / allowed        #
-    #    packages. This is the compliance artefact — it does NOT re-scan  #
-    #    or re-enforce; enforcement already happened in step 5.           #
+    # 5. Curation audit report                                            #
+    #    Queries the Artifactory audit log — does not re-enforce.        #
     # ------------------------------------------------------------------ #
     - script: |
-        # Point jf at the conda prefix so it knows what was installed
         jf curation-audit \
           --format=json \
           2>&1 | tee curation.json
 
-        # Surface a human-readable summary in the pipeline log
         python3 - <<'EOF'
         import json, sys
 
         try:
             with open('curation.json') as f:
                 raw = f.read().strip()
-            # curation-audit may emit an array or a single object
             results = json.loads(raw) if raw.startswith('[') else [json.loads(raw)]
         except Exception as e:
             print(f"Could not parse curation.json: {e}")
@@ -195,21 +181,18 @@ stages:
         if blocked:
             print()
             for pkg in blocked:
-                print(f"  ✗ {pkg.get('name','?')}=={pkg.get('version','?')}")
+                print(f"  x {pkg.get('name','?')}=={pkg.get('version','?')}")
                 print(f"    Policy    : {pkg.get('policy_name','N/A')}")
                 print(f"    Condition : {pkg.get('condition_name','N/A')}")
                 print(f"    Reason    : {pkg.get('explanation','N/A')}")
                 print()
         print(f"{'='*60}\n")
-
-        # Step 5 already failed the pipeline if anything was blocked.
-        # This script is purely informational — always exits 0.
         EOF
       displayName: Publish curation audit report
       condition: always()
 
     # ------------------------------------------------------------------ #
-    # 7. Publish curation artefact for compliance trail                   #
+    # 6. Publish artefact                                                  #
     # ------------------------------------------------------------------ #
     - task: PublishPipelineArtifact@1
       inputs:
