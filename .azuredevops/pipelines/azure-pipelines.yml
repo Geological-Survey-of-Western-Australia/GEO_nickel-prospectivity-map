@@ -15,9 +15,10 @@ variables:
     value: $[contains(variables['Build.SourceBranch'], 'cicd')]
   - name: MAMBA_ROOT_PREFIX
     value: $(Agent.TempDirectory)/micromamba
-  # Add artifactory_conda_url to your gswa-jfrog variable group.
-  # e.g. https://yourorg.jfrog.io/artifactory/api/conda/conda-virtual
-  # Do NOT redeclare it here — that causes a cyclic reference error.
+  # Required in gswa-jfrog variable group:
+  #   jfrog_url              e.g. https://waresources.jfrog.io
+  #   jfrog_bot_token        Artifactory access token (secret)
+  #   artifactory_conda_repo e.g. conda-virtual  (repo name only, no path)
 
 pool:
   vmImage: ubuntu-latest
@@ -59,9 +60,29 @@ stages:
       displayName: Install micromamba
 
     # ------------------------------------------------------------------ #
-    # 3. Strip build strings + Windows/ESRI-only packages                 #
-    #    Rewrites channels to point at Artifactory so every request       #
-    #    flows through Curation.                                           #
+    # 3. Write .netrc — micromamba reads this automatically for auth.     #
+    #    Keeps credentials out of environment-scan.yml entirely.          #
+    #    The token is used as the password; 'x-token' as the login.      #
+    # ------------------------------------------------------------------ #
+    - script: |
+        # Extract hostname from jfrog_url (strip https://)
+        JFROG_HOST=$(echo "$JFROG_URL" | sed 's|https://||' | sed 's|/.*||')
+
+        cat >> ~/.netrc << EOF
+        machine $JFROG_HOST
+        login x-jf-authorization
+        password $JFROG_TOKEN
+        EOF
+        chmod 600 ~/.netrc
+        echo "netrc entry written for $JFROG_HOST"
+      env:
+        JFROG_URL: $(jfrog_url)
+        JFROG_TOKEN: $(jfrog_bot_token)
+      displayName: Write .netrc for Artifactory auth
+
+    # ------------------------------------------------------------------ #
+    # 4. Strip build strings + Windows/ESRI-only packages                 #
+    #    Channel URL has NO credentials — auth comes from .netrc.         #
     # ------------------------------------------------------------------ #
     - script: |
         python3 - <<'EOF'
@@ -98,15 +119,11 @@ stages:
 
             lines.append(f"{name}={version}" if version else name)
 
-        # Credentials are embedded in the channel URL so micromamba
-        # authenticates automatically — no separate auth step needed.
-        jfrog_url   = os.environ['JFROG_URL'].rstrip('/')
-        jfrog_user  = os.environ['JFROG_USER']
-        jfrog_token = os.environ['JFROG_TOKEN']
-        conda_repo  = os.environ['ARTIFACTORY_CONDA_REPO']  # just the repo name, e.g. conda-virtual
+        jfrog_url  = os.environ['JFROG_URL'].rstrip('/')
+        conda_repo = os.environ['ARTIFACTORY_CONDA_REPO']
 
-        # Format: https://user:token@host/artifactory/api/conda/repo-name
-        channel = f"{jfrog_url.replace('https://', f'https://{jfrog_user}:{jfrog_token}@')}/artifactory/api/conda/{conda_repo}"
+        # Clean channel URL — no credentials, .netrc handles auth
+        channel = f"{jfrog_url}/artifactory/api/conda/{conda_repo}"
 
         with open('environment-scan.yml', 'w') as f:
             f.write("name: scan-env\n")
@@ -117,26 +134,22 @@ stages:
                 f.write(f"  - {line}\n")
 
         print(f"Generated environment-scan.yml with {len(lines)} packages")
-        print(f"Channel: {jfrog_url}/artifactory/api/conda/{conda_repo}  (credentials redacted)")
+        print(f"Channel: {channel}")
         EOF
 
-        echo "--- environment-scan.yml (channel redacted) ---"
-        # Print without exposing the token
-        grep -v "https://" environment-scan.yml
-        echo "  - https://***:***@<artifactory>/api/conda/<repo>"
+        echo "--- environment-scan.yml ---"
+        cat environment-scan.yml
       env:
         JFROG_URL: $(jfrog_url)
-        JFROG_USER: $(jfrog_bot_user)
-        JFROG_TOKEN: $(jfrog_bot_token)
         ARTIFACTORY_CONDA_REPO: $(artifactory_conda_repo)
       displayName: Strip build strings, rewrite channels to Artifactory
 
     # ------------------------------------------------------------------ #
-    # 4. Install via Artifactory — Curation enforces policy inline        #
+    # 5. Install via Artifactory — Curation enforces policy inline        #
     #                                                                     #
-    #    Credentials are embedded in the channel URL (step 3).           #
-    #    If a package violates your Curation policy, Artifactory          #
-    #    returns a 403 and micromamba exits non-zero, failing the build.  #
+    #    micromamba uses ~/.netrc for auth automatically.                 #
+    #    A Curation-blocked package returns 403; micromamba exits 1       #
+    #    and the step fails, blocking the pipeline.                       #
     # ------------------------------------------------------------------ #
     - script: |
         micromamba create \
@@ -147,8 +160,7 @@ stages:
       displayName: Install via Artifactory (Curation enforces policy)
 
     # ------------------------------------------------------------------ #
-    # 5. Curation audit report                                            #
-    #    Queries the Artifactory audit log — does not re-enforce.        #
+    # 6. Curation audit report — runs even if step 5 failed              #
     # ------------------------------------------------------------------ #
     - script: |
         jf curation-audit \
@@ -192,7 +204,7 @@ stages:
       condition: always()
 
     # ------------------------------------------------------------------ #
-    # 6. Publish artefact                                                  #
+    # 7. Publish artefact                                                  #
     # ------------------------------------------------------------------ #
     - task: PublishPipelineArtifact@1
       inputs:
