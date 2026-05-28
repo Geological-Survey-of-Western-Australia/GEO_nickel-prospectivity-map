@@ -13,9 +13,13 @@ variables:
     value: $[contains(variables['Build.SourceBranch'], 'releases/')]
   - name: isCICD
     value: $[contains(variables['Build.SourceBranch'], 'cicd')]
-  # micromamba root — all pkgs cache here, no base env overhead
   - name: MAMBA_ROOT_PREFIX
     value: $(Agent.TempDirectory)/micromamba
+  # Your Artifactory virtual conda repo that has Curation enabled.
+  # Set this in the gswa-jfrog variable group alongside jfrog_url.
+  # e.g. https://yourorg.jfrog.io/artifactory/api/conda/conda-virtual
+  - name: ARTIFACTORY_CONDA_URL
+    value: $(artifactory_conda_url)
 
 pool:
   vmImage: ubuntu-latest
@@ -25,6 +29,10 @@ stages:
   displayName: Curation Scan
   jobs:
   - job: CurationAudit
+    displayName: Curate environment.yml via Artifactory
+    pool:
+      vmImage: ubuntu-latest
+
     steps:
 
     # ------------------------------------------------------------------ #
@@ -42,7 +50,7 @@ stages:
       displayName: Install and configure JFrog CLI
 
     # ------------------------------------------------------------------ #
-    # 2. micromamba — single static binary, ~1 s install, no base env     #
+    # 2. micromamba                                                        #
     # ------------------------------------------------------------------ #
     - script: |
         curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
@@ -53,11 +61,12 @@ stages:
 
     # ------------------------------------------------------------------ #
     # 3. Strip build strings + Windows/ESRI-only packages                 #
-    #    Identical logic to before — kept in Python for clarity           #
+    #    Also rewrites channels to point at Artifactory so that           #
+    #    every package request flows through Curation.                    #
     # ------------------------------------------------------------------ #
     - script: |
         python3 - <<'EOF'
-        import yaml, sys
+        import yaml, sys, os
 
         WINDOWS_ONLY = {
           'vc', 'vs2015_runtime', 'win_inet_pton', 'wincertstore',
@@ -90,144 +99,121 @@ stages:
 
             lines.append(f"{name}={version}" if version else name)
 
+        # Replace channels with the single Artifactory virtual repo.
+        # Curation enforces policy on every request that flows through it;
+        # --override-channels ensures nothing sneaks past to the public internet.
+        artifactory_url = os.environ['ARTIFACTORY_CONDA_URL']
+
         with open('environment-scan.yml', 'w') as f:
             f.write("name: scan-env\n")
             f.write("channels:\n")
-            for ch in env.get('channels', ['defaults']):
-                f.write(f"  - {ch}\n")
+            f.write(f"  - {artifactory_url}\n")
             f.write("dependencies:\n")
             for line in lines:
                 f.write(f"  - {line}\n")
 
         print(f"Generated environment-scan.yml with {len(lines)} packages")
+        print(f"Channel: {artifactory_url}")
         EOF
 
         echo "--- environment-scan.yml ---"
         cat environment-scan.yml
-      displayName: Strip build strings, generate scannable environment
-      # No conda/pyyaml install needed — system Python 3 has yaml via
-      # the `python3-yaml` package pre-installed on ubuntu-latest
+      env:
+        ARTIFACTORY_CONDA_URL: $(ARTIFACTORY_CONDA_URL)
+      displayName: Strip build strings, rewrite channels to Artifactory
 
     # ------------------------------------------------------------------ #
-    # 4. Download packages via micromamba (no install, no base env)       #
-    #    micromamba caches to $MAMBA_ROOT_PREFIX/pkgs automatically       #
+    # 4. Configure micromamba auth for Artifactory                        #
+    #    Curation requires authenticated requests to evaluate packages    #
+    #    against your org's policies.                                     #
     # ------------------------------------------------------------------ #
     - script: |
-        mkdir -p conda-pkgs
+        micromamba auth login \
+          --host "$(jfrog_url)" \
+          --token "$(jfrog_bot_token)"
+      displayName: Authenticate micromamba with Artifactory
 
-        # micromamba create --download-only resolves the full dep tree
-        # and fetches .conda / .tar.bz2 into the pkgs cache without
-        # extracting or activating anything. Significantly faster than
-        # miniconda because:
-        #   - no Python base env to bootstrap
-        #   - parallel downloads by default (libcurl multi-thread)
-        #   - libsolv dependency resolver vs conda's slower Python solver
+    # ------------------------------------------------------------------ #
+    # 5. Install via Artifactory — Curation enforces policy inline        #
+    #                                                                     #
+    #    Any package that violates your Curation policy is blocked at     #
+    #    download time. The install fails immediately with a clear error  #
+    #    message identifying the blocked package and violated policy.     #
+    #    No packages need to be on disk first — enforcement happens at    #
+    #    the proxy layer in Artifactory before bytes are transferred.     #
+    # ------------------------------------------------------------------ #
+    - script: |
         micromamba create \
           --name scan-env \
           --file environment-scan.yml \
-          --channel defaults \
-          --channel esri \
           --override-channels \
-          --download-only \
-          --yes \
-          2>&1 || true
-
-        # Collect everything micromamba cached
-        find "$(MAMBA_ROOT_PREFIX)/pkgs" \( -name "*.conda" -o -name "*.tar.bz2" \) \
-          -exec cp {} conda-pkgs/ \; 2>/dev/null || true
-
-        echo "Downloaded $(ls conda-pkgs | wc -l) packages"
-        ls conda-pkgs/
-      displayName: Download conda packages (micromamba)
+          --yes
+      displayName: Install via Artifactory (Curation enforces policy)
 
     # ------------------------------------------------------------------ #
-    # 5. Xray scan — unchanged, works on the same artifact directory      #
+    # 6. Curation audit report                                            #
+    #                                                                     #
+    #    jf curation-audit queries the Artifactory audit log for this     #
+    #    run and produces a structured report of blocked / allowed        #
+    #    packages. This is the compliance artefact — it does NOT re-scan  #
+    #    or re-enforce; enforcement already happened in step 5.           #
     # ------------------------------------------------------------------ #
     - script: |
-        jf scan conda-pkgs/ --format=json  > xray.json
-      displayName: Scan conda packages with Xray
+        # Point jf at the conda prefix so it knows what was installed
+        jf curation-audit \
+          --format=json \
+          2>&1 | tee curation.json
 
-    - task: PublishPipelineArtifact@1
-      inputs:
-        targetPath: xray.json
-        artifactName: XrayJsonResults
-      displayName: Publish JSON results
-
-    # ------------------------------------------------------------------ #
-    # 6. Vulnerability gate — unchanged                                   #
-    # ------------------------------------------------------------------ #
-    - script: |
+        # Surface a human-readable summary in the pipeline log
         python3 - <<'EOF'
         import json, sys
-        from collections import defaultdict
 
-        FAIL_ON = {'CRITICAL', 'HIGH'}
-
-        with open('xray.json') as f:
-            results = json.load(f)
-
-        all_vulns = []
-        for pkg in results:
-            component_id = pkg.get('component_id', 'unknown')
-            for vuln in pkg.get('vulnerabilities', []):
-                all_vulns.append({
-                    'component_id': component_id,
-                    'cve':          vuln.get('cves', [{}])[0].get('cve', 'N/A') if vuln.get('cves') else 'N/A',
-                    'cvss_v3':      vuln.get('cves', [{}])[0].get('cvss_v3_score', 'N/A') if vuln.get('cves') else 'N/A',
-                    'severity':     vuln.get('severity', 'Unknown').upper(),
-                    'issue_id':     vuln.get('issue_id', 'N/A'),
-                    'summary':      vuln.get('summary', '')[:120] + '...',
-                    'fixed_versions': [
-                        fv
-                        for comp in vuln.get('components', {}).values()
-                        for fv in comp.get('fixed_versions', [])
-                    ],
-                })
-
-        if not all_vulns:
-            print("No vulnerabilities found.")
+        try:
+            with open('curation.json') as f:
+                raw = f.read().strip()
+            # curation-audit may emit an array or a single object
+            results = json.loads(raw) if raw.startswith('[') else [json.loads(raw)]
+        except Exception as e:
+            print(f"Could not parse curation.json: {e}")
             sys.exit(0)
 
-        by_severity = defaultdict(list)
-        for v in all_vulns:
-            by_severity[v['severity']].append(v)
+        blocked = []
+        allowed = 0
+        for entry in results:
+            for pkg in entry.get('blocked', []):
+                blocked.append(pkg)
+            allowed += len(entry.get('approved', []))
 
-        SEV_ORDER = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'UNKNOWN']
-        print(f"\n{'='*70}")
-        print(f" XRAY VULNERABILITY REPORT — {len(all_vulns)} findings")
-        print(f"{'='*70}")
-
-        for sev in SEV_ORDER:
-            vulns = by_severity.get(sev, [])
-            if not vulns:
-                continue
-            print(f"\n── {sev} ({len(vulns)}) {'*** BLOCKING ***' if sev in FAIL_ON else ''}")
-            for v in vulns:
-                fix = ', '.join(v['fixed_versions']) if v['fixed_versions'] else 'no fix listed'
-                print(f"   {v['issue_id']} | {v['cve']} | CVSS {v['cvss_v3']}")
-                print(f"   Package : {v['component_id']}")
-                print(f"   Fix     : {fix}")
-                print(f"   Summary : {v['summary']}")
+        print(f"\n{'='*60}")
+        print(f" CURATION REPORT")
+        print(f"{'='*60}")
+        print(f"  Approved : {allowed}")
+        print(f"  Blocked  : {len(blocked)}")
+        if blocked:
+            print()
+            for pkg in blocked:
+                print(f"  ✗ {pkg.get('name','?')}=={pkg.get('version','?')}")
+                print(f"    Policy    : {pkg.get('policy_name','N/A')}")
+                print(f"    Condition : {pkg.get('condition_name','N/A')}")
+                print(f"    Reason    : {pkg.get('explanation','N/A')}")
                 print()
+        print(f"{'='*60}\n")
 
-        print(f"{'='*70}")
-        print(f" Summary:")
-        for sev in SEV_ORDER:
-            count = len(by_severity.get(sev, []))
-            if count:
-                marker = ' <-- BLOCKING' if sev in FAIL_ON else ''
-                print(f"   {sev:<10} {count}{marker}")
-        print(f"{'='*70}\n")
-
-        blocking = [v for v in all_vulns if v['severity'] in FAIL_ON]
-        if blocking:
-            print(f"##[error]Pipeline failed: {len(blocking)} {'/'.join(FAIL_ON)} vulnerabilities found.")
-            sys.exit(1)
-        else:
-            print("No blocking vulnerabilities found. Pipeline continues.")
-            sys.exit(0)
+        # Step 5 already failed the pipeline if anything was blocked.
+        # This script is purely informational — always exits 0.
         EOF
-      displayName: Check for vulnerabilities
+      displayName: Publish curation audit report
+      condition: always()
+
+    # ------------------------------------------------------------------ #
+    # 7. Publish curation artefact for compliance trail                   #
+    # ------------------------------------------------------------------ #
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: curation.json
+        artifactName: CurationResults
+      displayName: Publish curation JSON
+      condition: always()
 
 
 # ------------------------------------------------------------------ #
@@ -236,9 +222,9 @@ stages:
 - stage: Github
   displayName: Publish to GitHub
   dependsOn:
-    - Xray
+    - Curation
   condition: and(
-    succeeded('Xray'),
+    succeeded('Curation'),
     eq(variables.isMain, true) )
   jobs:
     - job: Mirror
