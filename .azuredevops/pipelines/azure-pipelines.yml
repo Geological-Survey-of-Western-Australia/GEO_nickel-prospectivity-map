@@ -52,9 +52,9 @@ stages:
 - stage: Github
   displayName: 'Publish to GitHub'
   dependsOn: 
-    - Xray
+    - Curation
   condition: and( 
-    succeeded('Xray'), 
+    succeeded('Curation'), 
     eq(variables.isMain, true) )
   jobs:
     - job: Mirror
