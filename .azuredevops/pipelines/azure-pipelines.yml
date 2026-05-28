@@ -55,6 +55,9 @@ stages:
     - script: |
         curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
           | tar -xvj bin/micromamba
+        # prependpath takes effect in subsequent steps only, so use the
+        # explicit path here and export for the remainder of this step
+        export PATH="$(pwd)/bin:$PATH"
         echo "##vso[task.prependpath]$(pwd)/bin"
         micromamba --version
       displayName: Install micromamba
