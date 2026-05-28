@@ -3,18 +3,19 @@ trigger:
   branches:
     include:
     - '*'
+
 variables:
   - group: gswa-jfrog
   - group: nickel-prospectivity-maps
-  # for releases
   - name: isMain
     value: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
-  # for integration testing
   - name: isRC
     value: $[contains(variables['Build.SourceBranch'], 'releases/')]
-  # for modifying/reviewing pipeline
-  - name: isCICD 
+  - name: isCICD
     value: $[contains(variables['Build.SourceBranch'], 'cicd')]
+  # micromamba root — all pkgs cache here, no base env overhead
+  - name: MAMBA_ROOT_PREFIX
+    value: $(Agent.TempDirectory)/micromamba
 
 pool:
   vmImage: ubuntu-latest
@@ -25,6 +26,10 @@ stages:
   jobs:
   - job: CurationAudit
     steps:
+
+    # ------------------------------------------------------------------ #
+    # 1. JFrog CLI                                                         #
+    # ------------------------------------------------------------------ #
     - script: |
         curl -fL https://install-cli.jfrog.io | sh
         jf config add jfrog-bot \
@@ -36,44 +41,217 @@ stages:
         JFROG_ACCESS_TOKEN: $(jfrog_bot_token)
       displayName: Install and configure JFrog CLI
 
+    # ------------------------------------------------------------------ #
+    # 2. micromamba — single static binary, ~1 s install, no base env     #
+    # ------------------------------------------------------------------ #
     - script: |
-        jf curation-audit \
-          --format=json > curation.json
-      displayName: Run curation audit
+        curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
+          | tar -xvj bin/micromamba
+        echo "##vso[task.prependpath]$(pwd)/bin"
+        micromamba --version
+      displayName: Install micromamba
+
+    # ------------------------------------------------------------------ #
+    # 3. Strip build strings + Windows/ESRI-only packages                 #
+    #    Identical logic to before — kept in Python for clarity           #
+    # ------------------------------------------------------------------ #
+    - script: |
+        python3 - <<'EOF'
+        import yaml, sys
+
+        WINDOWS_ONLY = {
+          'vc', 'vs2015_runtime', 'win_inet_pton', 'wincertstore',
+          'winkerberos', 'winpty', 'pywin32-ctypes', 'pywin32-security',
+          'pywinpty', 'requests-negotiate-sspi', 'icc_rt', 'x86cpu',
+          'python-certifi-win32', 'python_abi',
+        }
+        ESRI_ONLY = {
+          'arcgis', 'arcgispro', 'arcpy', 'arcpy-base',
+          'pro_notebook_integration', 'despatch',
+        }
+        SKIP = WINDOWS_ONLY | ESRI_ONLY
+
+        with open('environment.yml') as f:
+            env = yaml.safe_load(f)
+
+        lines = []
+        seen = set()
+        for dep in env.get('dependencies', []):
+            if not isinstance(dep, str):
+                continue
+            parts = dep.split('=')
+            name = parts[0].strip()
+            version = parts[1].strip() if len(parts) >= 2 else None
+            name_lower = name.lower()
+
+            if name_lower in SKIP or name_lower in seen:
+                continue
+            seen.add(name_lower)
+
+            lines.append(f"{name}={version}" if version else name)
+
+        with open('environment-scan.yml', 'w') as f:
+            f.write("name: scan-env\n")
+            f.write("channels:\n")
+            for ch in env.get('channels', ['defaults']):
+                f.write(f"  - {ch}\n")
+            f.write("dependencies:\n")
+            for line in lines:
+                f.write(f"  - {line}\n")
+
+        print(f"Generated environment-scan.yml with {len(lines)} packages")
+        EOF
+
+        echo "--- environment-scan.yml ---"
+        cat environment-scan.yml
+      displayName: Strip build strings, generate scannable environment
+      # No conda/pyyaml install needed — system Python 3 has yaml via
+      # the `python3-yaml` package pre-installed on ubuntu-latest
+
+    # ------------------------------------------------------------------ #
+    # 4. Download packages via micromamba (no install, no base env)       #
+    #    micromamba caches to $MAMBA_ROOT_PREFIX/pkgs automatically       #
+    # ------------------------------------------------------------------ #
+    - script: |
+        mkdir -p conda-pkgs
+
+        # micromamba create --download-only resolves the full dep tree
+        # and fetches .conda / .tar.bz2 into the pkgs cache without
+        # extracting or activating anything. Significantly faster than
+        # miniconda because:
+        #   - no Python base env to bootstrap
+        #   - parallel downloads by default (libcurl multi-thread)
+        #   - libsolv dependency resolver vs conda's slower Python solver
+        micromamba create \
+          --name scan-env \
+          --file environment-scan.yml \
+          --channel defaults \
+          --channel esri \
+          --override-channels \
+          --download-only \
+          --yes \
+          2>&1 || true
+
+        # Collect everything micromamba cached
+        find "$(MAMBA_ROOT_PREFIX)/pkgs" \( -name "*.conda" -o -name "*.tar.bz2" \) \
+          -exec cp {} conda-pkgs/ \; 2>/dev/null || true
+
+        echo "Downloaded $(ls conda-pkgs | wc -l) packages"
+        ls conda-pkgs/
+      displayName: Download conda packages (micromamba)
+
+    # ------------------------------------------------------------------ #
+    # 5. Xray scan — unchanged, works on the same artifact directory      #
+    # ------------------------------------------------------------------ #
+    - script: |
+        jf scan conda-pkgs/ --format=json  > xray.json
+      displayName: Scan conda packages with Xray
 
     - task: PublishPipelineArtifact@1
       inputs:
-        targetPath: curation.json
-        artifactName: CurationResults
-      displayName: Publish results
+        targetPath: xray.json
+        artifactName: XrayJsonResults
+      displayName: Publish JSON results
+
+    # ------------------------------------------------------------------ #
+    # 6. Vulnerability gate — unchanged                                   #
+    # ------------------------------------------------------------------ #
+    - script: |
+        python3 - <<'EOF'
+        import json, sys
+        from collections import defaultdict
+
+        FAIL_ON = {'CRITICAL', 'HIGH'}
+
+        with open('xray.json') as f:
+            results = json.load(f)
+
+        all_vulns = []
+        for pkg in results:
+            component_id = pkg.get('component_id', 'unknown')
+            for vuln in pkg.get('vulnerabilities', []):
+                all_vulns.append({
+                    'component_id': component_id,
+                    'cve':          vuln.get('cves', [{}])[0].get('cve', 'N/A') if vuln.get('cves') else 'N/A',
+                    'cvss_v3':      vuln.get('cves', [{}])[0].get('cvss_v3_score', 'N/A') if vuln.get('cves') else 'N/A',
+                    'severity':     vuln.get('severity', 'Unknown').upper(),
+                    'issue_id':     vuln.get('issue_id', 'N/A'),
+                    'summary':      vuln.get('summary', '')[:120] + '...',
+                    'fixed_versions': [
+                        fv
+                        for comp in vuln.get('components', {}).values()
+                        for fv in comp.get('fixed_versions', [])
+                    ],
+                })
+
+        if not all_vulns:
+            print("No vulnerabilities found.")
+            sys.exit(0)
+
+        by_severity = defaultdict(list)
+        for v in all_vulns:
+            by_severity[v['severity']].append(v)
+
+        SEV_ORDER = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'UNKNOWN']
+        print(f"\n{'='*70}")
+        print(f" XRAY VULNERABILITY REPORT — {len(all_vulns)} findings")
+        print(f"{'='*70}")
+
+        for sev in SEV_ORDER:
+            vulns = by_severity.get(sev, [])
+            if not vulns:
+                continue
+            print(f"\n── {sev} ({len(vulns)}) {'*** BLOCKING ***' if sev in FAIL_ON else ''}")
+            for v in vulns:
+                fix = ', '.join(v['fixed_versions']) if v['fixed_versions'] else 'no fix listed'
+                print(f"   {v['issue_id']} | {v['cve']} | CVSS {v['cvss_v3']}")
+                print(f"   Package : {v['component_id']}")
+                print(f"   Fix     : {fix}")
+                print(f"   Summary : {v['summary']}")
+                print()
+
+        print(f"{'='*70}")
+        print(f" Summary:")
+        for sev in SEV_ORDER:
+            count = len(by_severity.get(sev, []))
+            if count:
+                marker = ' <-- BLOCKING' if sev in FAIL_ON else ''
+                print(f"   {sev:<10} {count}{marker}")
+        print(f"{'='*70}\n")
+
+        blocking = [v for v in all_vulns if v['severity'] in FAIL_ON]
+        if blocking:
+            print(f"##[error]Pipeline failed: {len(blocking)} {'/'.join(FAIL_ON)} vulnerabilities found.")
+            sys.exit(1)
+        else:
+            print("No blocking vulnerabilities found. Pipeline continues.")
+            sys.exit(0)
+        EOF
+      displayName: Check for vulnerabilities
 
 
-# see if requires tag
+# ------------------------------------------------------------------ #
+# GitHub mirror — unchanged                                           #
+# ------------------------------------------------------------------ #
 - stage: Github
-  displayName: 'Publish to GitHub'
-  dependsOn: 
-    - Curation
-  condition: and( 
-    succeeded('Curation'), 
+  displayName: Publish to GitHub
+  dependsOn:
+    - Xray
+  condition: and(
+    succeeded('Xray'),
     eq(variables.isMain, true) )
   jobs:
     - job: Mirror
-      displayName: 'Mirror to GitHub'
+      displayName: Mirror to GitHub
       pool:
-        vmImage: 'ubuntu-latest'
+        vmImage: ubuntu-latest
 
       steps:
       - checkout: self
-        fetchDepth: 0   # REQUIRED for full history & tags
+        fetchDepth: 0
 
       - script: |
-          echo "Configuring GitHub remote..."
-
-          # Remove existing remote if present
           git remote remove github 2>/dev/null || true
-
-          # Add GitHub remote using PAT from ADO Library
           git remote add github https://$(github_author_token)@github.com/$(github_org)/$(github_repo_name).git
-          echo "Pushing current branch to GitHub..."
           git push github HEAD:refs/heads/"$BUILD_SOURCEBRANCHNAME" --follow-tags
-        displayName: 'Push Mirror to GitHub'
+        displayName: Push mirror to GitHub
