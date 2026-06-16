@@ -89,7 +89,6 @@ stages:
           repo = os.environ['ARTIFACTORY_CONDA_REPO']
           with open('environment-scan.yml', 'w') as f:
               f.write("name: scan-env\n")
-              f.write("platforms:\n  - linux-64\n")
               f.write(f"channels:\n  - {url}/artifactory/api/conda/{repo}\n")
               f.write("dependencies:\n")
               f.writelines(f"  - {l}\n" for l in lines)
@@ -126,14 +125,21 @@ stages:
       inputs:
         script: |
           export PATH="$HOME/miniconda/bin:$PATH"
+          # Configure Artifactory auth via conda's native credential store
+          conda config --set ssl_verify true
+          conda config --add default_channels ""
+          conda config --set channel_alias "$JFROG_URL/artifactory/api/conda"
+          conda config --set channel_priority strict
+          # Pass token via the URL directly — conda respects user:password@ in channel URLs
           JFROG_HOST=$(echo "$JFROG_URL" | sed 's|https://||;s|/.*||')
-          printf "machine %s\nlogin x-jf-authorization\npassword %s\n" \
-            "$JFROG_HOST" "$JFROG_TOKEN" > ~/.netrc
-          chmod 600 ~/.netrc
+          AUTHED_CHANNEL="https://x-jf-authorization:$JFROG_TOKEN@$JFROG_HOST/artifactory/api/conda/$ARTIFACTORY_CONDA_REPO"
+          # Rewrite channel in environment-scan.yml with authed URL
+          sed -i "s|$JFROG_URL/artifactory/api/conda/$ARTIFACTORY_CONDA_REPO|$AUTHED_CHANNEL|g" environment-scan.yml
           conda env create --name scan-env --file environment-scan.yml
       env:
         JFROG_URL: $(jfrog_url)
         JFROG_TOKEN: $(jfrog_bot_token)
+        ARTIFACTORY_CONDA_REPO: $(artifactory_conda_repo)
 
     # ------------------------------------------------------------------ #
     # 6. Publish build info and trigger Xray scan — SECURITY GATE        #
