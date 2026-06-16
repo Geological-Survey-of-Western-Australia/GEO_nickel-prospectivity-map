@@ -101,23 +101,18 @@ stages:
 
     # ------------------------------------------------------------------ #
     # 5. Install via Artifactory                                          #
-    #                                                                      #
-    #    Auth bridged from JFrog CLI config written in step 1.           #
     # ------------------------------------------------------------------ #
     - script: |
         JFROG_HOST=$(echo "$JFROG_URL" | sed 's|https://||;s|/.*||')
-        TOKEN=$(python3 -c "
-        import json, os
-        d = json.load(open(os.path.expanduser('~/.jfrog/jfrog-cli.conf')))
-        print(d['servers'][0]['accessToken'])")
         printf "machine %s\nlogin x-jf-authorization\npassword %s\n" \
-          "$JFROG_HOST" "$TOKEN" > ~/.netrc
+          "$JFROG_HOST" "$JFROG_TOKEN" > ~/.netrc
         chmod 600 ~/.netrc
         micromamba create --name scan-env --file environment-scan.yml --override-channels --yes
       displayName: Install via Artifactory
       condition: ne(variables.CONDA_CACHE_RESTORED, 'true')
       env:
         JFROG_URL: $(jfrog_url)
+        JFROG_TOKEN: $(jfrog_bot_token)
 
     # ------------------------------------------------------------------ #
     # 6. Collect build info and publish to Artifactory                   #
