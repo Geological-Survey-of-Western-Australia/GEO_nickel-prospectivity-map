@@ -15,6 +15,10 @@ variables:
     value: 'v1'
   - name: JFROG_PLATFORM_CONNECTION
     value: 'service-ado-gsrsd-platform'
+  - name: BUILD_NAME
+    value: $(Build.DefinitionName)
+  - name: BUILD_NUMBER
+    value: $(Build.BuildNumber)
 
 pool:
   vmImage: ubuntu-latest
@@ -26,18 +30,27 @@ stages:
   - job: CurationAudit
     steps:
 
+    # ------------------------------------------------------------------ #
+    # 1. JFrog CLI                                                         #
+    # ------------------------------------------------------------------ #
     - task: JfrogCliV2@1
       displayName: Install JFrog CLI
       inputs:
         jfrogPlatformConnection: $(JFROG_PLATFORM_CONNECTION)
         command: 'jf --version'
 
+    # ------------------------------------------------------------------ #
+    # 2. micromamba                                                        #
+    # ------------------------------------------------------------------ #
     - script: |
         curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
           | tar -xvj bin/micromamba
         echo "##vso[task.prependpath]$(pwd)/bin"
       displayName: Install micromamba
 
+    # ------------------------------------------------------------------ #
+    # 3. Generate environment-scan.yml                                    #
+    # ------------------------------------------------------------------ #
     - script: |
         python3 - <<'EOF'
         import yaml, os
@@ -76,13 +89,9 @@ stages:
         JFROG_URL: $(jfrog_url)
         ARTIFACTORY_CONDA_REPO: $(artifactory_conda_repo)
 
-    - task: JfrogCliV2@1
-      displayName: Curation audit report
-      continueOnError: true
-      inputs:
-        jfrogPlatformConnection: $(JFROG_PLATFORM_CONNECTION)
-        command: 'jf curation-audit'
-
+    # ------------------------------------------------------------------ #
+    # 4. Restore conda cache                                              #
+    # ------------------------------------------------------------------ #
     - task: Cache@2
       displayName: Restore conda cache
       inputs:
@@ -90,11 +99,17 @@ stages:
         path: $(MAMBA_ROOT_PREFIX)/envs/scan-env
         cacheHitVar: CONDA_CACHE_RESTORED
 
+    # ------------------------------------------------------------------ #
+    # 5. Install via Artifactory                                          #
+    #                                                                      #
+    #    Auth bridged from JFrog CLI config written in step 1.           #
+    # ------------------------------------------------------------------ #
     - script: |
         JFROG_HOST=$(echo "$JFROG_URL" | sed 's|https://||;s|/.*||')
         TOKEN=$(python3 -c "
-        import json; d=json.load(open(os.path.expanduser('~/.jfrog/jfrog-cli.conf')))
-        print(d['servers'][0]['accessToken'])" 2>/dev/null || echo "")
+        import json, os
+        d = json.load(open(os.path.expanduser('~/.jfrog/jfrog-cli.conf')))
+        print(d['servers'][0]['accessToken'])")
         printf "machine %s\nlogin x-jf-authorization\npassword %s\n" \
           "$JFROG_HOST" "$TOKEN" > ~/.netrc
         chmod 600 ~/.netrc
@@ -104,12 +119,33 @@ stages:
       env:
         JFROG_URL: $(jfrog_url)
 
-    - task: PublishPipelineArtifact@1
-      displayName: Publish curation results
-      condition: always()
+    # ------------------------------------------------------------------ #
+    # 6. Collect build info and publish to Artifactory                   #
+    #                                                                      #
+    #    Captures the resolved environment as a build in Artifactory      #
+    #    so Xray can scan it in the next step.                           #
+    # ------------------------------------------------------------------ #
+    - task: JfrogCliV2@1
+      displayName: Collect and publish build info
       inputs:
-        targetPath: curation.json
-        artifactName: CurationResults
+        jfrogPlatformConnection: $(JFROG_PLATFORM_CONNECTION)
+        command: |
+          jf rt build-collect-env $(BUILD_NAME) $(BUILD_NUMBER)
+          jf rt build-publish $(BUILD_NAME) $(BUILD_NUMBER)
+
+    # ------------------------------------------------------------------ #
+    # 7. Xray build scan — SECURITY GATE                                  #
+    #                                                                      #
+    #    Scans the published build against your Xray watches/policies.   #
+    #    Fails the pipeline if any policy is violated. Pass --fail=true  #
+    #    to enforce; remove to run in notification-only mode.            #
+    # ------------------------------------------------------------------ #
+    - task: JfrogCliV2@1
+      displayName: Xray build scan (security gate)
+      inputs:
+        jfrogPlatformConnection: $(JFROG_PLATFORM_CONNECTION)
+        command: |
+          jf bs $(BUILD_NAME) $(BUILD_NUMBER) --fail=true
 
 
 - stage: Github
