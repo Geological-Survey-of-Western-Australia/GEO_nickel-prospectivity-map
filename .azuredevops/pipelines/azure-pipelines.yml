@@ -53,6 +53,7 @@ stages:
     # 3. Generate environment-scan.yml                                    #
     # ------------------------------------------------------------------ #
     - script: |
+        pip install --quiet pyyaml
         python3 - <<'EOF'
         import yaml, os
 
