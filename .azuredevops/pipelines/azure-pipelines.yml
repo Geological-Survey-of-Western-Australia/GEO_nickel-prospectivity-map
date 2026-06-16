@@ -9,8 +9,8 @@ variables:
   - group: nickel-prospectivity-maps
   - name: isMain
     value: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
-  - name: MAMBA_ROOT_PREFIX
-    value: $(Agent.TempDirectory)/micromamba
+  - name: CONDA_ENVS_PATH
+    value: $(HOME)/miniconda/envs
   - name: CACHE_VERSION
     value: 'v1'
   - name: JFROG_PLATFORM_CONNECTION
@@ -40,13 +40,14 @@ stages:
         command: 'jf --version'
 
     # ------------------------------------------------------------------ #
-    # 2. micromamba                                                        #
+    # 2. conda                                                             #
     # ------------------------------------------------------------------ #
     - script: |
-        curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
-          | tar -xvj bin/micromamba
-        echo "##vso[task.prependpath]$(pwd)/bin"
-      displayName: Install micromamba
+        wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O miniconda.sh
+        bash miniconda.sh -b -p $HOME/miniconda
+        echo "##vso[task.prependpath]$HOME/miniconda/bin"
+        conda --version
+      displayName: Install conda
 
     # ------------------------------------------------------------------ #
     # 3. Generate environment-scan.yml                                    #
@@ -55,14 +56,8 @@ stages:
         python3 - <<'EOF'
         import yaml, os
 
-        SKIP = {
-          'vc', 'vs2015_runtime', 'win_inet_pton', 'wincertstore', 'winkerberos',
-          'winpty', 'pywin32-ctypes', 'pywin32-security', 'pywinpty',
-          'requests-negotiate-sspi', 'icc_rt', 'x86cpu', 'python-certifi-win32',
-          'python_abi', 'arcgis', 'arcgispro', 'arcpy', 'arcpy-base',
-          'pro_notebook_integration', 'despatch',
-        }
-
+        # Build strings are stripped so conda can resolve cross-platform,
+        # but all packages are included — JFrog policies handle compliance.
         with open('environment.yml') as f:
             env = yaml.safe_load(f)
 
@@ -72,7 +67,7 @@ stages:
                 continue
             parts = dep.split('=')
             name, version = parts[0].strip(), (parts[1].strip() if len(parts) >= 2 else None)
-            if name.lower() in SKIP or name.lower() in seen:
+            if name.lower() in seen:
                 continue
             seen.add(name.lower())
             lines.append(f"{name}={version}" if version else name)
@@ -80,7 +75,7 @@ stages:
         url  = os.environ['JFROG_URL'].rstrip('/')
         repo = os.environ['ARTIFACTORY_CONDA_REPO']
         with open('environment-scan.yml', 'w') as f:
-            f.write(f"name: scan-env\nchannels:\n  - {url}/artifactory/api/conda/{repo}\ndependencies:\n")
+            f.write(f"name: scan-env\nplatforms:\n  - linux-64\nchannels:\n  - {url}/artifactory/api/conda/{repo}\ndependencies:\n")
             f.writelines(f"  - {l}\n" for l in lines)
         print(f"Written {len(lines)} packages")
         EOF
@@ -96,7 +91,7 @@ stages:
       displayName: Restore conda cache
       inputs:
         key: '"conda-env" | "$(CACHE_VERSION)" | environment.yml'
-        path: $(MAMBA_ROOT_PREFIX)/envs/scan-env
+        path: $(HOME)/miniconda/envs/scan-env
         cacheHitVar: CONDA_CACHE_RESTORED
 
     # ------------------------------------------------------------------ #
@@ -107,7 +102,7 @@ stages:
         printf "machine %s\nlogin x-jf-authorization\npassword %s\n" \
           "$JFROG_HOST" "$JFROG_TOKEN" > ~/.netrc
         chmod 600 ~/.netrc
-        micromamba create --name scan-env --file environment-scan.yml --override-channels --yes
+        conda env create --name scan-env --file environment-scan.yml --force
       displayName: Install via Artifactory
       condition: ne(variables.CONDA_CACHE_RESTORED, 'true')
       env:
