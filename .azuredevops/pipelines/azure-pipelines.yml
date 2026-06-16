@@ -15,6 +15,11 @@ variables:
     value: $[contains(variables['Build.SourceBranch'], 'cicd')]
   - name: MAMBA_ROOT_PREFIX
     value: $(Agent.TempDirectory)/micromamba
+  # Cache key: changes only when environment.yml content changes.
+  # Increment CACHE_VERSION manually to force a full cache bust
+  # (e.g. after a JFrog policy change you want to re-validate).
+  - name: CACHE_VERSION
+    value: 'v1'
   # Required in gswa-jfrog variable group:
   #   jfrog_url              e.g. https://waresources.jfrog.io
   #   jfrog_bot_token        Artifactory access token (secret)
@@ -24,6 +29,9 @@ pool:
   vmImage: ubuntu-latest
 
 stages:
+# ====================================================================== #
+# STAGE 1 — Curation                                                      #
+# ====================================================================== #
 - stage: Curation
   displayName: Curation Scan
   jobs:
@@ -60,14 +68,10 @@ stages:
       displayName: Install micromamba
 
     # ------------------------------------------------------------------ #
-    # 3. Write .netrc — micromamba reads this automatically for auth.     #
-    #    Keeps credentials out of environment-scan.yml entirely.          #
-    #    The token is used as the password; 'x-token' as the login.      #
+    # 3. Write .netrc for Artifactory auth                                 #
     # ------------------------------------------------------------------ #
     - script: |
-        # Extract hostname from jfrog_url (strip https://)
         JFROG_HOST=$(echo "$JFROG_URL" | sed 's|https://||' | sed 's|/.*||')
-
         cat >> ~/.netrc << EOF
         machine $JFROG_HOST
         login x-jf-authorization
@@ -82,7 +86,6 @@ stages:
 
     # ------------------------------------------------------------------ #
     # 4. Strip build strings + Windows/ESRI-only packages                 #
-    #    Channel URL has NO credentials — auth comes from .netrc.         #
     # ------------------------------------------------------------------ #
     - script: |
         python3 - <<'EOF'
@@ -121,8 +124,6 @@ stages:
 
         jfrog_url  = os.environ['JFROG_URL'].rstrip('/')
         conda_repo = os.environ['ARTIFACTORY_CONDA_REPO']
-
-        # Clean channel URL — no credentials, .netrc handles auth
         channel = f"{jfrog_url}/artifactory/api/conda/{conda_repo}"
 
         with open('environment-scan.yml', 'w') as f:
@@ -145,22 +146,15 @@ stages:
       displayName: Strip build strings, rewrite channels to Artifactory
 
     # ------------------------------------------------------------------ #
-    # 5. Install via Artifactory — Curation enforces policy inline        #
-    #                                                                     #
-    #    micromamba uses ~/.netrc for auth automatically.                 #
-    #    A Curation-blocked package returns 403; micromamba exits 1       #
-    #    and the step fails, blocking the pipeline.                       #
-    # ------------------------------------------------------------------ #
-    - script: |
-        micromamba create \
-          --name scan-env \
-          --file environment-scan.yml \
-          --override-channels \
-          --yes
-      displayName: Install via Artifactory (Curation enforces policy)
-
-    # ------------------------------------------------------------------ #
-    # 6. Curation audit report — runs even if step 5 failed              #
+    # 5. Curation audit — PRIMARY SECURITY GATE                           #
+    #                                                                      #
+    #    Runs BEFORE any install. Checks every package in                  #
+    #    environment-scan.yml against your Curation policies in JFrog      #
+    #    without downloading a single file.                                #
+    #                                                                      #
+    #    Collects ALL blocked packages before failing — does not stop at   #
+    #    the first violation. The full list is printed at the end to       #
+    #    support downstream admin triage and remediation tasks.            #
     # ------------------------------------------------------------------ #
     - script: |
         jf curation-audit \
@@ -179,32 +173,84 @@ stages:
             sys.exit(0)
 
         blocked = []
-        allowed = 0
+        approved = []
         for entry in results:
             for pkg in entry.get('blocked', []):
                 blocked.append(pkg)
-            allowed += len(entry.get('approved', []))
+            for pkg in entry.get('approved', []):
+                approved.append(pkg)
 
         print(f"\n{'='*60}")
         print(f" CURATION REPORT")
         print(f"{'='*60}")
-        print(f"  Approved : {allowed}")
+        print(f"  Approved : {len(approved)}")
         print(f"  Blocked  : {len(blocked)}")
+
+        if approved:
+            print(f"\n  APPROVED PACKAGES ({len(approved)})")
+            print(f"  {'-'*40}")
+            for pkg in sorted(approved, key=lambda p: p.get('name', '').lower()):
+                print(f"  + {pkg.get('name','?')}=={pkg.get('version','?')}")
+
         if blocked:
-            print()
-            for pkg in blocked:
+            print(f"\n  BLOCKED PACKAGES ({len(blocked)}) — action required")
+            print(f"  {'-'*40}")
+            for pkg in sorted(blocked, key=lambda p: p.get('name', '').lower()):
                 print(f"  x {pkg.get('name','?')}=={pkg.get('version','?')}")
                 print(f"    Policy    : {pkg.get('policy_name','N/A')}")
                 print(f"    Condition : {pkg.get('condition_name','N/A')}")
                 print(f"    Reason    : {pkg.get('explanation','N/A')}")
                 print()
+
         print(f"{'='*60}\n")
+
+        # Exit after printing the full report — never on first violation
+        if blocked:
+            print(f"Pipeline blocked: {len(blocked)} package(s) failed curation policy.")
+            print("Resolve all items listed above before re-running.")
+            sys.exit(1)
+
+        print("All packages approved — proceeding to install.")
         EOF
-      displayName: Publish curation audit report
-      condition: always()
+      displayName: "Curation audit (security gate — full report before fail)"
 
     # ------------------------------------------------------------------ #
-    # 7. Publish artefact                                                  #
+    # 6. Restore cached conda environment                                  #
+    #                                                                      #
+    #    Cache key = CACHE_VERSION + hash of environment.yml.             #
+    #    A hit skips the entire micromamba install (step 7).              #
+    #    A miss (env.yml changed, or CACHE_VERSION bumped) runs step 7    #
+    #    and saves the new environment at step 8.                         #
+    #                                                                      #
+    #    Default Azure DevOps cache quota: 10 GB per pipeline.            #
+    #    Bump CACHE_VERSION at the top of this file to force a full bust. #
+    # ------------------------------------------------------------------ #
+    - task: Cache@2
+      inputs:
+        key: '"conda-env" | "$(CACHE_VERSION)" | environment.yml'
+        path: $(MAMBA_ROOT_PREFIX)/envs/scan-env
+        cacheHitVar: CONDA_CACHE_RESTORED
+      displayName: Restore conda environment cache
+
+    # ------------------------------------------------------------------ #
+    # 7. Install via Artifactory — only runs on cache miss                 #
+    #                                                                      #
+    #    By the time we reach this step, curation-audit (step 5) has      #
+    #    already confirmed all packages are policy-compliant. This step    #
+    #    is now purely about materialising the environment, not enforcing  #
+    #    security — that gate has already been passed.                     #
+    # ------------------------------------------------------------------ #
+    - script: |
+        micromamba create \
+          --name scan-env \
+          --file environment-scan.yml \
+          --override-channels \
+          --yes
+      displayName: Install via Artifactory (runs only on cache miss)
+      condition: ne(variables.CONDA_CACHE_RESTORED, 'true')
+
+    # ------------------------------------------------------------------ #
+    # 8. Publish artefacts — always runs                                   #
     # ------------------------------------------------------------------ #
     - task: PublishPipelineArtifact@1
       inputs:
@@ -214,9 +260,9 @@ stages:
       condition: always()
 
 
-# ------------------------------------------------------------------ #
-# GitHub mirror — unchanged                                           #
-# ------------------------------------------------------------------ #
+# ====================================================================== #
+# STAGE 2 — GitHub mirror (unchanged)                                     #
+# ====================================================================== #
 - stage: Github
   displayName: Publish to GitHub
   dependsOn:
