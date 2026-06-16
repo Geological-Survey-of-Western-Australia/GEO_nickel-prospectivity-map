@@ -9,8 +9,6 @@ variables:
   - group: nickel-prospectivity-maps
   - name: isMain
     value: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
-  - name: CONDA_ENVS_PATH
-    value: $(HOME)/miniconda/envs
   - name: CACHE_VERSION
     value: 'v1'
   - name: JFROG_PLATFORM_CONNECTION
@@ -28,10 +26,12 @@ stages:
   displayName: Curation Scan
   jobs:
   - job: CurationAudit
+    pool:
+      vmImage: ubuntu-latest
     steps:
 
     # ------------------------------------------------------------------ #
-    # 1. JFrog CLI                                                         #
+    # 1. JFrog CLI via Platform V2 service connection                     #
     # ------------------------------------------------------------------ #
     - task: JfrogCliV2@1
       displayName: Install JFrog CLI
@@ -40,47 +40,65 @@ stages:
         command: 'jf --version'
 
     # ------------------------------------------------------------------ #
-    # 2. conda                                                             #
+    # 2. Miniconda                                                         #
     # ------------------------------------------------------------------ #
-    - script: |
-        wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O miniconda.sh
-        bash miniconda.sh -b -p $HOME/miniconda
-        echo "##vso[task.prependpath]$HOME/miniconda/bin"
-        conda --version
-      displayName: Install conda
+    - task: CmdLine@2
+      displayName: Install Miniconda
+      inputs:
+        script: |
+          wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O miniconda.sh
+          bash miniconda.sh -b -p "$HOME/miniconda"
+          export PATH="$HOME/miniconda/bin:$PATH"
+          conda config --set solver libmamba
+          conda install -n base conda-libmamba-solver -q -y
+          conda --version
 
     # ------------------------------------------------------------------ #
     # 3. Generate environment-scan.yml                                    #
+    #                                                                      #
+    #    - Strips build strings for cross-platform resolution             #
+    #    - Sets platforms: [linux-64] so conda skips Windows-only pkgs   #
+    #    - All packages included — JFrog policies enforce compliance      #
     # ------------------------------------------------------------------ #
-    - script: |
-        pip install --quiet pyyaml
-        python3 - <<'EOF'
-        import yaml, os
-
-        # Build strings are stripped so conda can resolve cross-platform,
-        # but all packages are included — JFrog policies handle compliance.
-        with open('environment.yml') as f:
-            env = yaml.safe_load(f)
-
-        seen, lines = set(), []
-        for dep in env.get('dependencies', []):
-            if not isinstance(dep, str):
-                continue
-            parts = dep.split('=')
-            name, version = parts[0].strip(), (parts[1].strip() if len(parts) >= 2 else None)
-            if name.lower() in seen:
-                continue
-            seen.add(name.lower())
-            lines.append(f"{name}={version}" if version else name)
-
-        url  = os.environ['JFROG_URL'].rstrip('/')
-        repo = os.environ['ARTIFACTORY_CONDA_REPO']
-        with open('environment-scan.yml', 'w') as f:
-            f.write(f"name: scan-env\nplatforms:\n  - linux-64\nchannels:\n  - {url}/artifactory/api/conda/{repo}\ndependencies:\n")
-            f.writelines(f"  - {l}\n" for l in lines)
-        print(f"Written {len(lines)} packages")
-        EOF
+    - task: CmdLine@2
       displayName: Generate environment-scan.yml
+      inputs:
+        script: |
+          export PATH="$HOME/miniconda/bin:$PATH"
+          conda install -n base pyyaml -q -y
+
+          python3 - <<'EOF'
+          import yaml, os
+
+          with open('environment.yml') as f:
+              env = yaml.safe_load(f)
+
+          seen, lines = set(), []
+          for dep in env.get('dependencies', []):
+              if not isinstance(dep, str):
+                  continue
+              parts = dep.split('=')
+              name = parts[0].strip()
+              version = parts[1].strip() if len(parts) >= 2 else None
+              if name.lower() in seen:
+                  continue
+              seen.add(name.lower())
+              lines.append(f"{name}={version}" if version else name)
+
+          url  = os.environ['JFROG_URL'].rstrip('/')
+          repo = os.environ['ARTIFACTORY_CONDA_REPO']
+          with open('environment-scan.yml', 'w') as f:
+              f.write("name: scan-env\n")
+              f.write("platforms:\n  - linux-64\n")
+              f.write(f"channels:\n  - {url}/artifactory/api/conda/{repo}\n")
+              f.write("dependencies:\n")
+              f.writelines(f"  - {l}\n" for l in lines)
+
+          print(f"Written {len(lines)} packages")
+          EOF
+
+          echo "--- environment-scan.yml ---"
+          cat environment-scan.yml
       env:
         JFROG_URL: $(jfrog_url)
         ARTIFACTORY_CONDA_REPO: $(artifactory_conda_repo)
@@ -97,45 +115,40 @@ stages:
 
     # ------------------------------------------------------------------ #
     # 5. Install via Artifactory                                          #
+    #                                                                      #
+    #    Auth via .netrc using jfrog_bot_token from variable group.      #
+    #    JFrog Curation/policies enforce compliance at the repo layer.   #
+    #    A blocked package returns 403 and the step fails.               #
     # ------------------------------------------------------------------ #
-    - script: |
-        JFROG_HOST=$(echo "$JFROG_URL" | sed 's|https://||;s|/.*||')
-        printf "machine %s\nlogin x-jf-authorization\npassword %s\n" \
-          "$JFROG_HOST" "$JFROG_TOKEN" > ~/.netrc
-        chmod 600 ~/.netrc
-        conda env create --name scan-env --file environment-scan.yml --force
+    - task: CmdLine@2
       displayName: Install via Artifactory
       condition: ne(variables.CONDA_CACHE_RESTORED, 'true')
+      inputs:
+        script: |
+          export PATH="$HOME/miniconda/bin:$PATH"
+          JFROG_HOST=$(echo "$JFROG_URL" | sed 's|https://||;s|/.*||')
+          printf "machine %s\nlogin x-jf-authorization\npassword %s\n" \
+            "$JFROG_HOST" "$JFROG_TOKEN" > ~/.netrc
+          chmod 600 ~/.netrc
+          conda env create --name scan-env --file environment-scan.yml
       env:
         JFROG_URL: $(jfrog_url)
         JFROG_TOKEN: $(jfrog_bot_token)
 
     # ------------------------------------------------------------------ #
-    # 6. Collect build info and publish to Artifactory                   #
+    # 6. Publish build info and trigger Xray scan — SECURITY GATE        #
     #                                                                      #
-    #    Captures the resolved environment as a build in Artifactory      #
-    #    so Xray can scan it in the next step.                           #
+    #    Captures the resolved environment as a build in Artifactory     #
+    #    and triggers an Xray scan against your configured policies.     #
+    #    --fail=true blocks the pipeline on any policy violation.        #
     # ------------------------------------------------------------------ #
     - task: JfrogCliV2@1
-      displayName: Collect and publish build info
+      displayName: Publish build info and Xray scan
       inputs:
         jfrogPlatformConnection: $(JFROG_PLATFORM_CONNECTION)
         command: |
           jf rt build-collect-env $(BUILD_NAME) $(BUILD_NUMBER)
           jf rt build-publish $(BUILD_NAME) $(BUILD_NUMBER)
-
-    # ------------------------------------------------------------------ #
-    # 7. Xray build scan — SECURITY GATE                                  #
-    #                                                                      #
-    #    Scans the published build against your Xray watches/policies.   #
-    #    Fails the pipeline if any policy is violated. Pass --fail=true  #
-    #    to enforce; remove to run in notification-only mode.            #
-    # ------------------------------------------------------------------ #
-    - task: JfrogCliV2@1
-      displayName: Xray build scan (security gate)
-      inputs:
-        jfrogPlatformConnection: $(JFROG_PLATFORM_CONNECTION)
-        command: |
           jf bs $(BUILD_NAME) $(BUILD_NUMBER) --fail=true
 
 
@@ -145,11 +158,15 @@ stages:
   condition: and(succeeded('Curation'), eq(variables.isMain, true))
   jobs:
   - job: Mirror
+    pool:
+      vmImage: ubuntu-latest
     steps:
     - checkout: self
       fetchDepth: 0
-    - script: |
-        git remote remove github 2>/dev/null || true
-        git remote add github https://$(github_author_token)@github.com/$(github_org)/$(github_repo_name).git
-        git push github HEAD:refs/heads/"$BUILD_SOURCEBRANCHNAME" --follow-tags
+    - task: CmdLine@2
       displayName: Push mirror to GitHub
+      inputs:
+        script: |
+          git remote remove github 2>/dev/null || true
+          git remote add github https://$(github_author_token)@github.com/$(github_org)/$(github_repo_name).git
+          git push github HEAD:refs/heads/"$BUILD_SOURCEBRANCHNAME" --follow-tags
