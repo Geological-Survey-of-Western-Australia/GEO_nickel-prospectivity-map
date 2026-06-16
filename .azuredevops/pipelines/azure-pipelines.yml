@@ -15,15 +15,16 @@ variables:
     value: $[contains(variables['Build.SourceBranch'], 'cicd')]
   - name: MAMBA_ROOT_PREFIX
     value: $(Agent.TempDirectory)/micromamba
-  # Cache key: changes only when environment.yml content changes.
-  # Increment CACHE_VERSION manually to force a full cache bust
-  # (e.g. after a JFrog policy change you want to re-validate).
+  # Increment to force a full cache bust (e.g. after a policy change).
   - name: CACHE_VERSION
     value: 'v1'
+  # JFrog Platform V2 service connection — covers both Artifactory and Xray.
+  # All JfrogCliV2@1 tasks reference this single connection.
+  - name: JFROG_PLATFORM_CONNECTION
+    value: 'service-ado-gsrsd-platform'
   # Required in gswa-jfrog variable group:
   #   jfrog_url              e.g. https://waresources.jfrog.io
-  #   jfrog_bot_token        Artifactory access token (secret)
-  #   artifactory_conda_repo e.g. conda-virtual  (repo name only, no path)
+  #   artifactory_conda_repo e.g. gswa-conda-virtual (repo name only)
 
 pool:
   vmImage: ubuntu-latest
@@ -43,18 +44,18 @@ stages:
     steps:
 
     # ------------------------------------------------------------------ #
-    # 1. JFrog CLI                                                         #
+    # 1. JFrog CLI — configured via Platform V2 service connection        #
+    #                                                                      #
+    #    JfrogCliV2@1 installs the CLI and writes auth into               #
+    #    ~/.jfrog/jfrog-cli.conf from the Platform V2 connection.         #
+    #    All subsequent jf commands inherit this context — no tokens,     #
+    #    no .netrc, no manual jf config add required anywhere.            #
     # ------------------------------------------------------------------ #
-    - script: |
-        curl -fL https://install-cli.jfrog.io | sh
-        jf config add jfrog-bot \
-          --url="$JFROG_URL" \
-          --access-token="$JFROG_ACCESS_TOKEN" \
-          --interactive=false
-      env:
-        JFROG_URL: $(jfrog_url)
-        JFROG_ACCESS_TOKEN: $(jfrog_bot_token)
+    - task: JfrogCliV2@1
       displayName: Install and configure JFrog CLI
+      inputs:
+        jfrogPlatformConnection: $(JFROG_PLATFORM_CONNECTION)
+        command: 'jf --version'   # no-op ping to confirm auth is working
 
     # ------------------------------------------------------------------ #
     # 2. micromamba                                                        #
@@ -68,24 +69,15 @@ stages:
       displayName: Install micromamba
 
     # ------------------------------------------------------------------ #
-    # 3. Write .netrc for Artifactory auth                                 #
-    # ------------------------------------------------------------------ #
-    - script: |
-        JFROG_HOST=$(echo "$JFROG_URL" | sed 's|https://||' | sed 's|/.*||')
-        cat >> ~/.netrc << EOF
-        machine $JFROG_HOST
-        login x-jf-authorization
-        password $JFROG_TOKEN
-        EOF
-        chmod 600 ~/.netrc
-        echo "netrc entry written for $JFROG_HOST"
-      env:
-        JFROG_URL: $(jfrog_url)
-        JFROG_TOKEN: $(jfrog_bot_token)
-      displayName: Write .netrc for Artifactory auth
-
-    # ------------------------------------------------------------------ #
-    # 4. Strip build strings + Windows/ESRI-only packages                 #
+    # 3. Strip build strings + Windows/ESRI-only packages                 #
+    #                                                                      #
+    #    Rewrites environment.yml into environment-scan.yml with:         #
+    #      - Windows-only and ESRI-only packages removed                  #
+    #      - Build strings stripped                                        #
+    #      - Channel pointed at Artifactory (clean URL, no credentials)   #
+    #                                                                      #
+    #    micromamba resolves auth from ~/.jfrog/jfrog-cli.conf written    #
+    #    by JfrogCliV2@1 above — no credentials in the channel URL.      #
     # ------------------------------------------------------------------ #
     - script: |
         python3 - <<'EOF'
@@ -124,7 +116,7 @@ stages:
 
         jfrog_url  = os.environ['JFROG_URL'].rstrip('/')
         conda_repo = os.environ['ARTIFACTORY_CONDA_REPO']
-        channel = f"{jfrog_url}/artifactory/api/conda/{conda_repo}"
+        channel    = f"{jfrog_url}/artifactory/api/conda/{conda_repo}"
 
         with open('environment-scan.yml', 'w') as f:
             f.write("name: scan-env\n")
@@ -146,21 +138,27 @@ stages:
       displayName: Strip build strings, rewrite channels to Artifactory
 
     # ------------------------------------------------------------------ #
-    # 5. Curation audit — PRIMARY SECURITY GATE                           #
+    # 4. Curation audit — PRIMARY SECURITY GATE                           #
     #                                                                      #
-    #    Runs BEFORE any install. Checks every package in                  #
-    #    environment-scan.yml against your Curation policies in JFrog      #
-    #    without downloading a single file.                                #
+    #    Runs jf curation-audit via JfrogCliV2@1 — auth from the         #
+    #    Platform V2 connection, no credentials needed in the command.    #
     #                                                                      #
-    #    Collects ALL blocked packages before failing — does not stop at   #
-    #    the first violation. The full list is printed at the end to       #
-    #    support downstream admin triage and remediation tasks.            #
+    #    continueOnError: true so the next step can collect and print     #
+    #    ALL violations before the pipeline fails — never stops at the    #
+    #    first blocked package.                                            #
+    # ------------------------------------------------------------------ #
+    - task: JfrogCliV2@1
+      displayName: Run curation audit (collect results)
+      continueOnError: true
+      inputs:
+        jfrogPlatformConnection: $(JFROG_PLATFORM_CONNECTION)
+        command: |
+          jf curation-audit --format=json 2>&1 | tee curation.json
+
+    # ------------------------------------------------------------------ #
+    # 4b. Parse and report all violations before failing                  #
     # ------------------------------------------------------------------ #
     - script: |
-        jf curation-audit \
-          --format=json \
-          2>&1 | tee curation.json
-
         python3 - <<'EOF'
         import json, sys
 
@@ -204,7 +202,6 @@ stages:
 
         print(f"{'='*60}\n")
 
-        # Exit after printing the full report — never on first violation
         if blocked:
             print(f"Pipeline blocked: {len(blocked)} package(s) failed curation policy.")
             print("Resolve all items listed above before re-running.")
@@ -212,18 +209,13 @@ stages:
 
         print("All packages approved — proceeding to install.")
         EOF
-      displayName: "Curation audit (security gate — full report before fail)"
+      displayName: Parse and report all curation violations
 
     # ------------------------------------------------------------------ #
-    # 6. Restore cached conda environment                                  #
+    # 5. Restore cached conda environment                                  #
     #                                                                      #
-    #    Cache key = CACHE_VERSION + hash of environment.yml.             #
-    #    A hit skips the entire micromamba install (step 7).              #
-    #    A miss (env.yml changed, or CACHE_VERSION bumped) runs step 7    #
-    #    and saves the new environment at step 8.                         #
-    #                                                                      #
-    #    Default Azure DevOps cache quota: 10 GB per pipeline.            #
-    #    Bump CACHE_VERSION at the top of this file to force a full bust. #
+    #    Keyed on CACHE_VERSION + environment.yml hash.                  #
+    #    Hit = skip install entirely. Miss = run step 6, then save.      #
     # ------------------------------------------------------------------ #
     - task: Cache@2
       inputs:
@@ -233,24 +225,27 @@ stages:
       displayName: Restore conda environment cache
 
     # ------------------------------------------------------------------ #
-    # 7. Install via Artifactory — only runs on cache miss                 #
+    # 6. Install via Artifactory — only on cache miss                     #
     #                                                                      #
-    #    By the time we reach this step, curation-audit (step 5) has      #
-    #    already confirmed all packages are policy-compliant. This step    #
-    #    is now purely about materialising the environment, not enforcing  #
-    #    security — that gate has already been passed.                     #
+    #    JfrogCliV2@1 wraps the micromamba call so the CLI can inject     #
+    #    Artifactory credentials into the conda channel resolution.       #
+    #    The channel URL in environment-scan.yml stays clean — no         #
+    #    embedded tokens, no .netrc required.                             #
     # ------------------------------------------------------------------ #
-    - script: |
-        micromamba create \
-          --name scan-env \
-          --file environment-scan.yml \
-          --override-channels \
-          --yes
+    - task: JfrogCliV2@1
       displayName: Install via Artifactory (runs only on cache miss)
       condition: ne(variables.CONDA_CACHE_RESTORED, 'true')
+      inputs:
+        jfrogPlatformConnection: $(JFROG_PLATFORM_CONNECTION)
+        command: |
+          micromamba create \
+            --name scan-env \
+            --file environment-scan.yml \
+            --override-channels \
+            --yes
 
     # ------------------------------------------------------------------ #
-    # 8. Publish artefacts — always runs                                   #
+    # 7. Publish curation JSON — always                                   #
     # ------------------------------------------------------------------ #
     - task: PublishPipelineArtifact@1
       inputs:
