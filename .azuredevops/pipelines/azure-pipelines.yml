@@ -9,274 +9,120 @@ variables:
   - group: nickel-prospectivity-maps
   - name: isMain
     value: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
-  - name: isRC
-    value: $[contains(variables['Build.SourceBranch'], 'releases/')]
-  - name: isCICD
-    value: $[contains(variables['Build.SourceBranch'], 'cicd')]
   - name: MAMBA_ROOT_PREFIX
     value: $(Agent.TempDirectory)/micromamba
-  # Increment to force a full cache bust (e.g. after a policy change).
   - name: CACHE_VERSION
     value: 'v1'
-  # JFrog Platform V2 service connection — covers both Artifactory and Xray.
-  # All JfrogCliV2@1 tasks reference this single connection.
   - name: JFROG_PLATFORM_CONNECTION
     value: 'service-ado-gsrsd-platform'
-  # Required in gswa-jfrog variable group:
-  #   jfrog_url              e.g. https://waresources.jfrog.io
-  #   artifactory_conda_repo e.g. gswa-conda-virtual (repo name only)
 
 pool:
   vmImage: ubuntu-latest
 
 stages:
-# ====================================================================== #
-# STAGE 1 — Curation                                                      #
-# ====================================================================== #
 - stage: Curation
   displayName: Curation Scan
   jobs:
   - job: CurationAudit
-    displayName: Curate environment.yml via Artifactory
-    pool:
-      vmImage: ubuntu-latest
-
     steps:
 
-    # ------------------------------------------------------------------ #
-    # 1. JFrog CLI — configured via Platform V2 service connection        #
-    #                                                                      #
-    #    JfrogCliV2@1 installs the CLI and writes auth into               #
-    #    ~/.jfrog/jfrog-cli.conf from the Platform V2 connection.         #
-    #    All subsequent jf commands inherit this context — no tokens,     #
-    #    no .netrc, no manual jf config add required anywhere.            #
-    # ------------------------------------------------------------------ #
     - task: JfrogCliV2@1
-      displayName: Install and configure JFrog CLI
+      displayName: Install JFrog CLI
       inputs:
         jfrogPlatformConnection: $(JFROG_PLATFORM_CONNECTION)
-        command: 'jf --version'   # no-op ping to confirm auth is working
+        command: 'jf --version'
 
-    # ------------------------------------------------------------------ #
-    # 2. micromamba                                                        #
-    # ------------------------------------------------------------------ #
     - script: |
         curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
           | tar -xvj bin/micromamba
-        export PATH="$(pwd)/bin:$PATH"
         echo "##vso[task.prependpath]$(pwd)/bin"
-        micromamba --version
       displayName: Install micromamba
 
-    # ------------------------------------------------------------------ #
-    # 3. Strip build strings + Windows/ESRI-only packages                 #
-    #                                                                      #
-    #    Rewrites environment.yml into environment-scan.yml with:         #
-    #      - Windows-only and ESRI-only packages removed                  #
-    #      - Build strings stripped                                        #
-    #      - Channel pointed at Artifactory (clean URL, no credentials)   #
-    #                                                                      #
-    #    micromamba resolves auth from ~/.jfrog/jfrog-cli.conf written    #
-    #    by JfrogCliV2@1 above — no credentials in the channel URL.      #
-    # ------------------------------------------------------------------ #
     - script: |
         python3 - <<'EOF'
-        import yaml, sys, os
+        import yaml, os
 
-        WINDOWS_ONLY = {
-          'vc', 'vs2015_runtime', 'win_inet_pton', 'wincertstore',
-          'winkerberos', 'winpty', 'pywin32-ctypes', 'pywin32-security',
-          'pywinpty', 'requests-negotiate-sspi', 'icc_rt', 'x86cpu',
-          'python-certifi-win32', 'python_abi',
-        }
-        ESRI_ONLY = {
-          'arcgis', 'arcgispro', 'arcpy', 'arcpy-base',
+        SKIP = {
+          'vc', 'vs2015_runtime', 'win_inet_pton', 'wincertstore', 'winkerberos',
+          'winpty', 'pywin32-ctypes', 'pywin32-security', 'pywinpty',
+          'requests-negotiate-sspi', 'icc_rt', 'x86cpu', 'python-certifi-win32',
+          'python_abi', 'arcgis', 'arcgispro', 'arcpy', 'arcpy-base',
           'pro_notebook_integration', 'despatch',
         }
-        SKIP = WINDOWS_ONLY | ESRI_ONLY
 
         with open('environment.yml') as f:
             env = yaml.safe_load(f)
 
-        lines = []
-        seen = set()
+        seen, lines = set(), []
         for dep in env.get('dependencies', []):
             if not isinstance(dep, str):
                 continue
             parts = dep.split('=')
-            name = parts[0].strip()
-            version = parts[1].strip() if len(parts) >= 2 else None
-            name_lower = name.lower()
-
-            if name_lower in SKIP or name_lower in seen:
+            name, version = parts[0].strip(), (parts[1].strip() if len(parts) >= 2 else None)
+            if name.lower() in SKIP or name.lower() in seen:
                 continue
-            seen.add(name_lower)
-
+            seen.add(name.lower())
             lines.append(f"{name}={version}" if version else name)
 
-        jfrog_url  = os.environ['JFROG_URL'].rstrip('/')
-        conda_repo = os.environ['ARTIFACTORY_CONDA_REPO']
-        channel    = f"{jfrog_url}/artifactory/api/conda/{conda_repo}"
-
+        url  = os.environ['JFROG_URL'].rstrip('/')
+        repo = os.environ['ARTIFACTORY_CONDA_REPO']
         with open('environment-scan.yml', 'w') as f:
-            f.write("name: scan-env\n")
-            f.write("channels:\n")
-            f.write(f"  - {channel}\n")
-            f.write("dependencies:\n")
-            for line in lines:
-                f.write(f"  - {line}\n")
-
-        print(f"Generated environment-scan.yml with {len(lines)} packages")
-        print(f"Channel: {channel}")
+            f.write(f"name: scan-env\nchannels:\n  - {url}/artifactory/api/conda/{repo}\ndependencies:\n")
+            f.writelines(f"  - {l}\n" for l in lines)
+        print(f"Written {len(lines)} packages")
         EOF
-
-        echo "--- environment-scan.yml ---"
-        cat environment-scan.yml
+      displayName: Generate environment-scan.yml
       env:
         JFROG_URL: $(jfrog_url)
         ARTIFACTORY_CONDA_REPO: $(artifactory_conda_repo)
-      displayName: Strip build strings, rewrite channels to Artifactory
 
-    # ------------------------------------------------------------------ #
-    # 4. Curation audit — PRIMARY SECURITY GATE                           #
-    #                                                                      #
-    #    Runs jf curation-audit via JfrogCliV2@1 — auth from the         #
-    #    Platform V2 connection, no credentials needed in the command.    #
-    #                                                                      #
-    #    continueOnError: true so the next step can collect and print     #
-    #    ALL violations before the pipeline fails — never stops at the    #
-    #    first blocked package.                                            #
-    # ------------------------------------------------------------------ #
     - task: JfrogCliV2@1
-      displayName: Run curation audit (collect results)
+      displayName: Curation audit report
       continueOnError: true
       inputs:
         jfrogPlatformConnection: $(JFROG_PLATFORM_CONNECTION)
-        command: |
-          jf curation-audit --format=json 2>&1 | tee curation.json
+        command: 'jf curation-audit'
 
-    # ------------------------------------------------------------------ #
-    # 4b. Parse and report all violations before failing                  #
-    # ------------------------------------------------------------------ #
-    - script: |
-        python3 - <<'EOF'
-        import json, sys
-
-        try:
-            with open('curation.json') as f:
-                raw = f.read().strip()
-            results = json.loads(raw) if raw.startswith('[') else [json.loads(raw)]
-        except Exception as e:
-            print(f"Could not parse curation.json: {e}")
-            sys.exit(0)
-
-        blocked = []
-        approved = []
-        for entry in results:
-            for pkg in entry.get('blocked', []):
-                blocked.append(pkg)
-            for pkg in entry.get('approved', []):
-                approved.append(pkg)
-
-        print(f"\n{'='*60}")
-        print(f" CURATION REPORT")
-        print(f"{'='*60}")
-        print(f"  Approved : {len(approved)}")
-        print(f"  Blocked  : {len(blocked)}")
-
-        if approved:
-            print(f"\n  APPROVED PACKAGES ({len(approved)})")
-            print(f"  {'-'*40}")
-            for pkg in sorted(approved, key=lambda p: p.get('name', '').lower()):
-                print(f"  + {pkg.get('name','?')}=={pkg.get('version','?')}")
-
-        if blocked:
-            print(f"\n  BLOCKED PACKAGES ({len(blocked)}) — action required")
-            print(f"  {'-'*40}")
-            for pkg in sorted(blocked, key=lambda p: p.get('name', '').lower()):
-                print(f"  x {pkg.get('name','?')}=={pkg.get('version','?')}")
-                print(f"    Policy    : {pkg.get('policy_name','N/A')}")
-                print(f"    Condition : {pkg.get('condition_name','N/A')}")
-                print(f"    Reason    : {pkg.get('explanation','N/A')}")
-                print()
-
-        print(f"{'='*60}\n")
-
-        if blocked:
-            print(f"Pipeline blocked: {len(blocked)} package(s) failed curation policy.")
-            print("Resolve all items listed above before re-running.")
-            sys.exit(1)
-
-        print("All packages approved — proceeding to install.")
-        EOF
-      displayName: Parse and report all curation violations
-
-    # ------------------------------------------------------------------ #
-    # 5. Restore cached conda environment                                  #
-    #                                                                      #
-    #    Keyed on CACHE_VERSION + environment.yml hash.                  #
-    #    Hit = skip install entirely. Miss = run step 6, then save.      #
-    # ------------------------------------------------------------------ #
     - task: Cache@2
+      displayName: Restore conda cache
       inputs:
         key: '"conda-env" | "$(CACHE_VERSION)" | environment.yml'
         path: $(MAMBA_ROOT_PREFIX)/envs/scan-env
         cacheHitVar: CONDA_CACHE_RESTORED
-      displayName: Restore conda environment cache
 
-    # ------------------------------------------------------------------ #
-    # 6. Install via Artifactory — only on cache miss                     #
-    #                                                                      #
-    #    JfrogCliV2@1 wraps the micromamba call so the CLI can inject     #
-    #    Artifactory credentials into the conda channel resolution.       #
-    #    The channel URL in environment-scan.yml stays clean — no         #
-    #    embedded tokens, no .netrc required.                             #
-    # ------------------------------------------------------------------ #
-    - task: JfrogCliV2@1
-      displayName: Install via Artifactory (runs only on cache miss)
+    - script: |
+        JFROG_HOST=$(echo "$JFROG_URL" | sed 's|https://||;s|/.*||')
+        TOKEN=$(python3 -c "
+        import json; d=json.load(open(os.path.expanduser('~/.jfrog/jfrog-cli.conf')))
+        print(d['servers'][0]['accessToken'])" 2>/dev/null || echo "")
+        printf "machine %s\nlogin x-jf-authorization\npassword %s\n" \
+          "$JFROG_HOST" "$TOKEN" > ~/.netrc
+        chmod 600 ~/.netrc
+        micromamba create --name scan-env --file environment-scan.yml --override-channels --yes
+      displayName: Install via Artifactory
       condition: ne(variables.CONDA_CACHE_RESTORED, 'true')
-      inputs:
-        jfrogPlatformConnection: $(JFROG_PLATFORM_CONNECTION)
-        command: |
-          micromamba create \
-            --name scan-env \
-            --file environment-scan.yml \
-            --override-channels \
-            --yes
+      env:
+        JFROG_URL: $(jfrog_url)
 
-    # ------------------------------------------------------------------ #
-    # 7. Publish curation JSON — always                                   #
-    # ------------------------------------------------------------------ #
     - task: PublishPipelineArtifact@1
+      displayName: Publish curation results
+      condition: always()
       inputs:
         targetPath: curation.json
         artifactName: CurationResults
-      displayName: Publish curation JSON
-      condition: always()
 
 
-# ====================================================================== #
-# STAGE 2 — GitHub mirror (unchanged)                                     #
-# ====================================================================== #
 - stage: Github
   displayName: Publish to GitHub
-  dependsOn:
-    - Curation
-  condition: and(
-    succeeded('Curation'),
-    eq(variables.isMain, true) )
+  dependsOn: Curation
+  condition: and(succeeded('Curation'), eq(variables.isMain, true))
   jobs:
-    - job: Mirror
-      displayName: Mirror to GitHub
-      pool:
-        vmImage: ubuntu-latest
-
-      steps:
-      - checkout: self
-        fetchDepth: 0
-
-      - script: |
-          git remote remove github 2>/dev/null || true
-          git remote add github https://$(github_author_token)@github.com/$(github_org)/$(github_repo_name).git
-          git push github HEAD:refs/heads/"$BUILD_SOURCEBRANCHNAME" --follow-tags
-        displayName: Push mirror to GitHub
+  - job: Mirror
+    steps:
+    - checkout: self
+      fetchDepth: 0
+    - script: |
+        git remote remove github 2>/dev/null || true
+        git remote add github https://$(github_author_token)@github.com/$(github_org)/$(github_repo_name).git
+        git push github HEAD:refs/heads/"$BUILD_SOURCEBRANCHNAME" --follow-tags
+      displayName: Push mirror to GitHub
