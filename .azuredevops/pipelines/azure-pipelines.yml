@@ -59,19 +59,32 @@ stages:
           export PATH="$HOME/miniconda/bin:$PATH"
           mkdir -p conda-pkgs
 
-          # Download packages without installing
-          # Uses the channels from environment-scan.yml
-          conda install \
-          --download-only \
-          --prefix /tmp/scan-prefix \
-          --channel defaults \
-          --channel esri \
-          --override-channels \
-          --platform linux-64 \
-          --yes \
-          $(python3 -c "
+          PKGS=$(python3 <<'PYEOF'
+          import yaml
+          with open('environment.yml') as f:
+              env = yaml.safe_load(f)
+          pkgs = [d for d in env.get('dependencies', []) if isinstance(d, str)]
+          out = []
+          for p in pkgs:
+              parts = p.split('=')
+              spec = '='.join(parts[:2]) if len(parts) >= 2 else parts[0]
+              out.append(spec)
+          print(' '.join(out))
+          PYEOF
+          )
 
-          # Conda caches downloads in pkgs dir - collect them
+          echo "Resolved package specs: $PKGS"
+
+          conda install \
+            --download-only \
+            --prefix /tmp/scan-prefix \
+            --channel defaults \
+            --channel esri \
+            --override-channels \
+            --platform linux-64 \
+            --yes \
+            $PKGS 2>&1 || true
+
           find "$HOME/miniconda/pkgs" -name "*.conda" -o -name "*.tar.bz2" \
             | xargs -I{} cp {} conda-pkgs/ 2>/dev/null || true
 
