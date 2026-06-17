@@ -51,66 +51,7 @@ stages:
           export PATH="$HOME/miniconda/bin:$PATH"
           conda config --set solver libmamba
           conda install -n base conda-libmamba-solver -q -y
-    - task: CmdLine@2
-      displayName: Strip build strings, generate scannable environment
-      inputs:
-        script: |
-          export PATH="$HOME/miniconda/bin:$PATH"
-          conda install -n base pyyaml -q -y
-
-          # Strip build strings and Windows-only packages that have no Linux equivalent
-          # but keep ALL packages that exist cross-platform
-          python3 - <<'EOF'
-          import yaml, re, sys
-
-          # Only skip packages that are genuinely Windows/ArcGIS-proprietary
-          # with no conda equivalent on any platform
-          WINDOWS_ONLY = {
-            'vc', 'vs2015_runtime', 'win_inet_pton', 'wincertstore',
-            'winkerberos', 'winpty', 'pywin32-ctypes', 'pywin32-security',
-            'pywinpty', 'requests-negotiate-sspi', 'icc_rt', 'x86cpu',
-            'python-certifi-win32', 'python_abi',
-          }
-          ESRI_ONLY = {
-            'arcgis', 'arcgispro', 'arcpy', 'arcpy-base',
-            'pro_notebook_integration', 'despatch',
-          }
-          SKIP = WINDOWS_ONLY | ESRI_ONLY
-
-          with open('environment.yml') as f:
-              env = yaml.safe_load(f)
-
-          lines = []
-          seen = set()
-          for dep in env.get('dependencies', []):
-              if not isinstance(dep, str):
-                  continue
-              parts = dep.split('=')
-              name = parts[0].strip()
-              version = parts[1].strip() if len(parts) >= 2 else None
-              name_lower = name.lower()
-
-              if name_lower in SKIP or name_lower in seen:
-                  continue
-              seen.add(name_lower)
-
-              # Keep version, strip build string
-              lines.append(f"{name}={version}" if version else name)
-
-          with open('environment-scan.yml', 'w') as f:
-              f.write("name: scan-env\n")
-              f.write("channels:\n")
-              for ch in env.get('channels', ['defaults']):
-                  f.write(f"  - {ch}\n")
-              f.write("dependencies:\n")
-              for line in lines:
-                  f.write(f"  - {line}\n")
-
-          print(f"Generated environment-scan.yml with {len(lines)} packages")
-          EOF
-
-          echo "--- environment-scan.yml ---"
-          cat environment-scan.yml
+          
     - task: CmdLine@2
       displayName: Download conda packages for scanning
       inputs:
@@ -121,14 +62,14 @@ stages:
           # Download packages without installing
           # Uses the channels from environment-scan.yml
           conda install \
-            --download-only \
-            --prefix /tmp/scan-prefix \
-            --file environment-scan.yml \
-            --channel defaults \
-            --channel esri \
-            --override-channels \
-            --yes \
-            2>&1 || true
+          --download-only \
+          --prefix /tmp/scan-prefix \
+          --channel defaults \
+          --channel esri \
+          --override-channels \
+          --platform linux-64 \
+          --yes \
+          $(python3 -c "
 
           # Conda caches downloads in pkgs dir - collect them
           find "$HOME/miniconda/pkgs" -name "*.conda" -o -name "*.tar.bz2" \
