@@ -3,147 +3,205 @@ trigger:
   branches:
     include:
     - '*'
-
 variables:
 - group: gswa-jfrog
 - group: nickel-prospectivity-maps
 - name: isMain
   value: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
-- name: CACHE_VERSION
-  value: 'v1'
-- name: JFROG_PLATFORM_CONNECTION
-  value: 'service-ado-gsrsd-platform'
-- name: BUILD_NAME
-  value: $(Build.DefinitionName)
-- name: BUILD_NUMBER
-  value: $(Build.BuildNumber)
-
+- name: isRC
+  value: $[contains(variables['Build.SourceBranch'], 'releases/')]
+- name: isCICD
+  value: $[contains(variables['Build.SourceBranch'], 'cicd')]
 pool:
   vmImage: ubuntu-latest
-
 stages:
-- stage: Curation
-  displayName: Curation Scan
+- stage: Xray
+  displayName: Xray Scan
   jobs:
-  - job: CurationAudit
+  - job: ScanEnvironment
+    displayName: Scan environment.yml
     pool:
       vmImage: ubuntu-latest
     steps:
-    - task: JfrogCliV2@1
-      displayName: Install JFrog CLI
+    - task: CmdLine@2
+      env:
+        JFROG_URL: $(jfrog_url)
+        JFROG_ACCESS_TOKEN: $(jfrog_bot_token)
+      displayName: Install and Configure JFrog CLI
       inputs:
-        jfrogPlatformConnection: $(JFROG_PLATFORM_CONNECTION)
-        command: 'jf --version'
-
+        script: |
+          curl -fL https://install-cli.jfrog.io | sh
+          jf config add jfrog-bot \
+            --url="$JFROG_URL" \
+            --access-token="$JFROG_ACCESS_TOKEN" \
+            --interactive=false
+    - task: CmdLine@2
+      displayName: Show environment.yml
+      inputs:
+        script: |
+          echo "Contents of environment.yml:"
+          cat environment.yml
     - task: CmdLine@2
       displayName: Install Miniconda
       inputs:
         script: |
           wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O miniconda.sh
           bash miniconda.sh -b -p "$HOME/miniconda"
+          echo "$HOME/miniconda/bin" >> $GITHUB_PATH
           export PATH="$HOME/miniconda/bin:$PATH"
-          conda install -n base conda-libmamba-solver -q -y
           conda config --set solver libmamba
-          conda --version
-
+          conda install -n base conda-libmamba-solver -q -y
     - task: CmdLine@2
-      displayName: Generate environment-scan.yml
+      displayName: Strip build strings, generate scannable environment
       inputs:
         script: |
           export PATH="$HOME/miniconda/bin:$PATH"
+          conda install -n base pyyaml -q -y
 
-          JFROG_HOST=$(echo "$JFROG_URL" | sed 's|https://||;s|/.*||')
-          AUTHED_CHANNEL="https://x-jf-token:${JFROG_TOKEN}@${JFROG_HOST}/artifactory/api/conda/${ARTIFACTORY_CONDA_REPO}"
+          # Strip build strings and Windows-only packages that have no Linux equivalent
+          # but keep ALL packages that exist cross-platform
+          python3 - <<'EOF'
+          import yaml, re, sys
 
-          echo "CWD: $(pwd)"
-          echo "environment.yml exists: $(test -f environment.yml && echo yes || echo no)"
-
-          python3 <<EOF
-          import yaml, os, sys
-
-          print(f"Python CWD: {os.getcwd()}", file=sys.stderr)
-
-          authed_channel = os.environ['AUTHED_CHANNEL']
+          # Only skip packages that are genuinely Windows/ArcGIS-proprietary
+          # with no conda equivalent on any platform
+          WINDOWS_ONLY = {
+            'vc', 'vs2015_runtime', 'win_inet_pton', 'wincertstore',
+            'winkerberos', 'winpty', 'pywin32-ctypes', 'pywin32-security',
+            'pywinpty', 'requests-negotiate-sspi', 'icc_rt', 'x86cpu',
+            'python-certifi-win32', 'python_abi',
+          }
+          ESRI_ONLY = {
+            'arcgis', 'arcgispro', 'arcpy', 'arcpy-base',
+            'pro_notebook_integration', 'despatch',
+          }
+          SKIP = WINDOWS_ONLY | ESRI_ONLY
 
           with open('environment.yml') as f:
               env = yaml.safe_load(f)
 
-          seen, lines = set(), []
+          lines = []
+          seen = set()
           for dep in env.get('dependencies', []):
               if not isinstance(dep, str):
                   continue
               parts = dep.split('=')
-              name    = parts[0].strip()
+              name = parts[0].strip()
               version = parts[1].strip() if len(parts) >= 2 else None
-              if name.lower() in seen:
+              name_lower = name.lower()
+
+              if name_lower in SKIP or name_lower in seen:
                   continue
-              seen.add(name.lower())
+              seen.add(name_lower)
+
+              # Keep version, strip build string
               lines.append(f"{name}={version}" if version else name)
 
           with open('environment-scan.yml', 'w') as f:
               f.write("name: scan-env\n")
-              f.write(f"channels:\n  - {authed_channel}\n")
-              f.write("  - nodefaults\n")
+              f.write("channels:\n")
+              for ch in env.get('channels', ['defaults']):
+                  f.write(f"  - {ch}\n")
               f.write("dependencies:\n")
-              f.writelines(f"  - {l}\n" for l in lines)
+              for line in lines:
+                  f.write(f"  - {line}\n")
 
-          print(f"Written {len(lines)} packages from environment.yml", file=sys.stderr)
+          print(f"Generated environment-scan.yml with {len(lines)} packages")
           EOF
 
-          echo "--- environment-scan.yml (channels redacted) ---"
-          grep -v 'x-jf-token' environment-scan.yml
-      env:
-        JFROG_URL: $(jfrog_url)
-        JFROG_TOKEN: $(jfrog_bot_token)
-        ARTIFACTORY_CONDA_REPO: $(artifactory_conda_repo)
-        AUTHED_CHANNEL: "https://x-jf-token:$(jfrog_bot_token)@$(jfrog_url_host)/artifactory/api/conda/$(artifactory_conda_repo)"
-
-    - task: Cache@2
-      displayName: Restore conda cache
-      inputs:
-        key: '"conda-env" | "$(CACHE_VERSION)" | environment.yml'
-        path: $(HOME)/miniconda/envs/scan-env
-        cacheHitVar: CONDA_CACHE_RESTORED
-
+          echo "--- environment-scan.yml ---"
+          cat environment-scan.yml
     - task: CmdLine@2
-      displayName: Install via Artifactory
-      condition: ne(variables.CONDA_CACHE_RESTORED, 'true')
+      displayName: Download conda packages for scanning
       inputs:
         script: |
           export PATH="$HOME/miniconda/bin:$PATH"
-          conda config --set ssl_verify true
-          conda config --set channel_priority strict
-          conda env create --name scan-env --file environment-scan.yml -v
-      env:
-        JFROG_URL: $(jfrog_url)
-        JFROG_TOKEN: $(jfrog_bot_token)
-        ARTIFACTORY_CONDA_REPO: $(artifactory_conda_repo)
+          mkdir -p conda-pkgs
 
-    - task: JfrogCliV2@1
-      displayName: Publish build info and Xray scan
-      inputs:
-        jfrogPlatformConnection: $(JFROG_PLATFORM_CONNECTION)
-        command: |
-          jf rt build-collect-env $(BUILD_NAME) $(BUILD_NUMBER)
-          jf rt build-publish $(BUILD_NAME) $(BUILD_NUMBER)
-          jf bs $(BUILD_NAME) $(BUILD_NUMBER) --fail=true
+          # Download packages without installing
+          # Uses the channels from environment-scan.yml
+          conda install \
+            --download-only \
+            --prefix /tmp/scan-prefix \
+            --file environment-scan.yml \
+            --channel defaults \
+            --channel esri \
+            --override-channels \
+            --yes \
+            2>&1 || true
 
-- stage: Github
-  displayName: Publish to GitHub
-  dependsOn: Curation
-  condition: and(succeeded('Curation'), eq(variables.isMain, true))
-  jobs:
-  - job: Mirror
-    pool:
-      vmImage: ubuntu-latest
-    steps:
-    - checkout: self
-      fetchDepth: 0
+          # Conda caches downloads in pkgs dir - collect them
+          find "$HOME/miniconda/pkgs" -name "*.conda" -o -name "*.tar.bz2" \
+            | xargs -I{} cp {} conda-pkgs/ 2>/dev/null || true
 
+          echo "Downloaded $(ls conda-pkgs | wc -l) packages"
+          ls conda-pkgs/
     - task: CmdLine@2
-      displayName: Push mirror to GitHub
+      displayName: Scan conda packages with Xray
       inputs:
         script: |
+          # Scan the directory of actual conda artifacts
+          # Xray understands .conda and .tar.bz2 package formats natively
+          jf scan conda-pkgs/ \
+            --format=json > xray.json
+
+          jf scan conda-pkgs/ \
+            --format=sarif > xray.sarif
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: xray.sarif
+        artifactName: CodeAnalysisLogs
+      displayName: Publish SARIF Results
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: xray.json
+        artifactName: XrayJsonResults
+      displayName: Publish JSON Results
+    - task: CmdLine@2
+      displayName: Debug Xray JSON structure
+      inputs:
+        script: |
+          python3 - <<'EOF'
+          import json, sys
+
+          with open('xray.json') as f:
+              raw = json.load(f)
+
+          # Debug: show the top-level structure so we can see what Xray returns
+          if isinstance(raw, list):
+              print(f"Top level: list with {len(raw)} items")
+              if raw:
+                  print(f"First item keys: {list(raw[0].keys()) if isinstance(raw[0], dict) else type(raw[0])}")
+                  print(json.dumps(raw[0], indent=2)[:2000])
+          elif isinstance(raw, dict):
+              print(f"Top level: dict with keys: {list(raw.keys())}")
+              print(json.dumps(raw, indent=2)[:2000])
+          EOF
+- stage: Github
+  displayName: 'Publish to GitHub'
+  dependsOn:
+  - Xray
+  condition: and( succeeded('Xray'), eq(variables.isMain, true) )
+  jobs:
+  - job: Mirror
+    displayName: 'Mirror to GitHub'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      inputs:
+        repository: self
+        fetchDepth: 0
+    - task: CmdLine@2
+      displayName: 'Push Mirror to GitHub'
+      inputs:
+        script: |
+          echo "Configuring GitHub remote..."
+
+          # Remove existing remote if present
           git remote remove github 2>/dev/null || true
+
+          # Add GitHub remote using PAT from ADO Library
           git remote add github https://$(github_author_token)@github.com/$(github_org)/$(github_repo_name).git
+          echo "Pushing current branch to GitHub..."
           git push github HEAD:refs/heads/"$BUILD_SOURCEBRANCHNAME" --follow-tags
