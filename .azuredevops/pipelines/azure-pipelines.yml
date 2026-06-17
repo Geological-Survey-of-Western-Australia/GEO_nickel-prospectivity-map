@@ -52,13 +52,16 @@ stages:
         script: |
           export PATH="$HOME/miniconda/bin:$PATH"
 
-          # FIX: write the authed channel URL directly here, not in the install step.
-          # This keeps all credential injection in one place and avoids sed fragility.
           JFROG_HOST=$(echo "$JFROG_URL" | sed 's|https://||;s|/.*||')
           AUTHED_CHANNEL="https://x-jf-token:${JFROG_TOKEN}@${JFROG_HOST}/artifactory/api/conda/${ARTIFACTORY_CONDA_REPO}"
 
-          conda run -n base python3 - <<'EOF'
+          echo "CWD: $(pwd)"
+          echo "environment.yml exists: $(test -f environment.yml && echo yes || echo no)"
+
+          python3 <<EOF
           import yaml, os, sys
+
+          print(f"Python CWD: {os.getcwd()}", file=sys.stderr)
 
           authed_channel = os.environ['AUTHED_CHANNEL']
 
@@ -70,7 +73,7 @@ stages:
               if not isinstance(dep, str):
                   continue
               parts = dep.split('=')
-              name = parts[0].strip()
+              name    = parts[0].strip()
               version = parts[1].strip() if len(parts) >= 2 else None
               if name.lower() in seen:
                   continue
@@ -84,11 +87,11 @@ stages:
               f.write("dependencies:\n")
               f.writelines(f"  - {l}\n" for l in lines)
 
-          print(f"Written {len(lines)} packages", file=sys.stderr)
+          print(f"Written {len(lines)} packages from environment.yml", file=sys.stderr)
           EOF
 
           echo "--- environment-scan.yml (channels redacted) ---"
-          grep -v 'x-jf-token' environment-scan.yml || true
+          grep -v 'x-jf-token' environment-scan.yml
       env:
         JFROG_URL: $(jfrog_url)
         JFROG_TOKEN: $(jfrog_bot_token)
@@ -108,14 +111,8 @@ stages:
       inputs:
         script: |
           export PATH="$HOME/miniconda/bin:$PATH"
-
-          # FIX: channel URL already carries credentials from the generate step.
-          # No need for channel_alias or sed rewriting here.
-          # FIX: removed invalid `conda config --add default_channels ""`
-          # FIX: removed conflicting channel_alias (fights the authed URL in the yml)
           conda config --set ssl_verify true
           conda config --set channel_priority strict
-
           conda env create --name scan-env --file environment-scan.yml -v
       env:
         JFROG_URL: $(jfrog_url)
@@ -142,6 +139,7 @@ stages:
     steps:
     - checkout: self
       fetchDepth: 0
+
     - task: CmdLine@2
       displayName: Push mirror to GitHub
       inputs:
