@@ -5,18 +5,18 @@ trigger:
     - '*'
 
 variables:
-  - group: gswa-jfrog
-  - group: nickel-prospectivity-maps
-  - name: isMain
-    value: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
-  - name: CACHE_VERSION
-    value: 'v1'
-  - name: JFROG_PLATFORM_CONNECTION
-    value: 'service-ado-gsrsd-platform'
-  - name: BUILD_NAME
-    value: $(Build.DefinitionName)
-  - name: BUILD_NUMBER
-    value: $(Build.BuildNumber)
+- group: gswa-jfrog
+- group: nickel-prospectivity-maps
+- name: isMain
+  value: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
+- name: CACHE_VERSION
+  value: 'v1'
+- name: JFROG_PLATFORM_CONNECTION
+  value: 'service-ado-gsrsd-platform'
+- name: BUILD_NAME
+  value: $(Build.DefinitionName)
+- name: BUILD_NUMBER
+  value: $(Build.BuildNumber)
 
 pool:
   vmImage: ubuntu-latest
@@ -29,19 +29,12 @@ stages:
     pool:
       vmImage: ubuntu-latest
     steps:
-
-    # ------------------------------------------------------------------ #
-    # 1. JFrog CLI via Platform V2 service connection                     #
-    # ------------------------------------------------------------------ #
     - task: JfrogCliV2@1
       displayName: Install JFrog CLI
       inputs:
         jfrogPlatformConnection: $(JFROG_PLATFORM_CONNECTION)
         command: 'jf --version'
 
-    # ------------------------------------------------------------------ #
-    # 2. Miniconda                                                         #
-    # ------------------------------------------------------------------ #
     - task: CmdLine@2
       displayName: Install Miniconda
       inputs:
@@ -49,26 +42,25 @@ stages:
           wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O miniconda.sh
           bash miniconda.sh -b -p "$HOME/miniconda"
           export PATH="$HOME/miniconda/bin:$PATH"
-          conda config --set solver libmamba
           conda install -n base conda-libmamba-solver -q -y
+          conda config --set solver libmamba
           conda --version
 
-    # ------------------------------------------------------------------ #
-    # 3. Generate environment-scan.yml                                    #
-    #                                                                      #
-    #    - Strips build strings for cross-platform resolution             #
-    #    - Sets platforms: [linux-64] so conda skips Windows-only pkgs   #
-    #    - All packages included — JFrog policies enforce compliance      #
-    # ------------------------------------------------------------------ #
     - task: CmdLine@2
       displayName: Generate environment-scan.yml
       inputs:
         script: |
           export PATH="$HOME/miniconda/bin:$PATH"
-          conda install -n base pyyaml -q -y
 
-          python3 - <<'EOF'
-          import yaml, os
+          # FIX: write the authed channel URL directly here, not in the install step.
+          # This keeps all credential injection in one place and avoids sed fragility.
+          JFROG_HOST=$(echo "$JFROG_URL" | sed 's|https://||;s|/.*||')
+          AUTHED_CHANNEL="https://x-jf-token:${JFROG_TOKEN}@${JFROG_HOST}/artifactory/api/conda/${ARTIFACTORY_CONDA_REPO}"
+
+          conda run -n base python3 - <<'EOF'
+          import yaml, os, sys
+
+          authed_channel = os.environ['AUTHED_CHANNEL']
 
           with open('environment.yml') as f:
               env = yaml.safe_load(f)
@@ -85,26 +77,24 @@ stages:
               seen.add(name.lower())
               lines.append(f"{name}={version}" if version else name)
 
-          url  = os.environ['JFROG_URL'].rstrip('/')
-          repo = os.environ['ARTIFACTORY_CONDA_REPO']
           with open('environment-scan.yml', 'w') as f:
               f.write("name: scan-env\n")
-              f.write(f"channels:\n  - {url}/artifactory/api/conda/{repo}\n")
+              f.write(f"channels:\n  - {authed_channel}\n")
+              f.write("  - nodefaults\n")
               f.write("dependencies:\n")
               f.writelines(f"  - {l}\n" for l in lines)
 
-          print(f"Written {len(lines)} packages")
+          print(f"Written {len(lines)} packages", file=sys.stderr)
           EOF
 
-          echo "--- environment-scan.yml ---"
-          cat environment-scan.yml
+          echo "--- environment-scan.yml (channels redacted) ---"
+          grep -v 'x-jf-token' environment-scan.yml || true
       env:
         JFROG_URL: $(jfrog_url)
+        JFROG_TOKEN: $(jfrog_bot_token)
         ARTIFACTORY_CONDA_REPO: $(artifactory_conda_repo)
+        AUTHED_CHANNEL: "https://x-jf-token:$(jfrog_bot_token)@$(jfrog_url_host)/artifactory/api/conda/$(artifactory_conda_repo)"
 
-    # ------------------------------------------------------------------ #
-    # 4. Restore conda cache                                              #
-    # ------------------------------------------------------------------ #
     - task: Cache@2
       displayName: Restore conda cache
       inputs:
@@ -112,42 +102,26 @@ stages:
         path: $(HOME)/miniconda/envs/scan-env
         cacheHitVar: CONDA_CACHE_RESTORED
 
-    # ------------------------------------------------------------------ #
-    # 5. Install via Artifactory                                          #
-    #                                                                      #
-    #    Auth via .netrc using jfrog_bot_token from variable group.      #
-    #    JFrog Curation/policies enforce compliance at the repo layer.   #
-    #    A blocked package returns 403 and the step fails.               #
-    # ------------------------------------------------------------------ #
     - task: CmdLine@2
       displayName: Install via Artifactory
       condition: ne(variables.CONDA_CACHE_RESTORED, 'true')
       inputs:
         script: |
           export PATH="$HOME/miniconda/bin:$PATH"
-          # Configure Artifactory auth via conda's native credential store
+
+          # FIX: channel URL already carries credentials from the generate step.
+          # No need for channel_alias or sed rewriting here.
+          # FIX: removed invalid `conda config --add default_channels ""`
+          # FIX: removed conflicting channel_alias (fights the authed URL in the yml)
           conda config --set ssl_verify true
-          conda config --add default_channels ""
-          conda config --set channel_alias "$JFROG_URL/artifactory/api/conda"
           conda config --set channel_priority strict
-          # Pass token via the URL directly — conda respects user:password@ in channel URLs
-          JFROG_HOST=$(echo "$JFROG_URL" | sed 's|https://||;s|/.*||')
-          AUTHED_CHANNEL="https://x-jf-authorization:$JFROG_TOKEN@$JFROG_HOST/artifactory/api/conda/$ARTIFACTORY_CONDA_REPO"
-          # Rewrite channel in environment-scan.yml with authed URL
-          sed -i "s|$JFROG_URL/artifactory/api/conda/$ARTIFACTORY_CONDA_REPO|$AUTHED_CHANNEL|g" environment-scan.yml
-          conda env create --name scan-env --file environment-scan.yml
+
+          conda env create --name scan-env --file environment-scan.yml -v
       env:
         JFROG_URL: $(jfrog_url)
         JFROG_TOKEN: $(jfrog_bot_token)
         ARTIFACTORY_CONDA_REPO: $(artifactory_conda_repo)
 
-    # ------------------------------------------------------------------ #
-    # 6. Publish build info and trigger Xray scan — SECURITY GATE        #
-    #                                                                      #
-    #    Captures the resolved environment as a build in Artifactory     #
-    #    and triggers an Xray scan against your configured policies.     #
-    #    --fail=true blocks the pipeline on any policy violation.        #
-    # ------------------------------------------------------------------ #
     - task: JfrogCliV2@1
       displayName: Publish build info and Xray scan
       inputs:
@@ -156,7 +130,6 @@ stages:
           jf rt build-collect-env $(BUILD_NAME) $(BUILD_NUMBER)
           jf rt build-publish $(BUILD_NAME) $(BUILD_NUMBER)
           jf bs $(BUILD_NAME) $(BUILD_NUMBER) --fail=true
-
 
 - stage: Github
   displayName: Publish to GitHub
