@@ -52,11 +52,13 @@ stages:
     # 2. micromamba                                                        #
     # ------------------------------------------------------------------ #
     - powershell: |
-        $url  = "https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-win-64.zip"
-        $zip  = "$env:AGENT_TEMPDIRECTORY\micromamba.zip"
         $dest = "$env:AGENT_TEMPDIRECTORY\micromamba"
-        Invoke-WebRequest -Uri $url -OutFile $zip
-        Expand-Archive -Path $zip -DestinationPath $dest -Force
+        New-Item -ItemType Directory -Force -Path $dest | Out-Null
+
+        Invoke-WebRequest `
+          -Uri "https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-win-64" `
+          -OutFile "$dest\micromamba.exe"
+
         echo "##vso[task.prependpath]$dest"
         & "$dest\micromamba.exe" --version
       displayName: Install micromamba
