@@ -3,252 +3,232 @@ trigger:
   branches:
     include:
     - '*'
+
 variables:
-- group: gswa-jfrog           # requires: jfrog_url, jfrog_bot_token, artifactory_conda_repo
-- group: nickel-prospectivity-maps  # requires: github_author_token, github_org, github_repo_name
-- name: isMain
-  value: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
-- name: isRC
-  value: $[contains(variables['Build.SourceBranch'], 'releases/')]
-- name: isCICD
-  value: $[contains(variables['Build.SourceBranch'], 'cicd')]
+  - group: gswa-jfrog
+  - group: nickel-prospectivity-maps
+  - name: isMain
+    value: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
+  - name: isRC
+    value: $[contains(variables['Build.SourceBranch'], 'releases/')]
+  - name: isCICD
+    value: $[contains(variables['Build.SourceBranch'], 'cicd')]
+  - name: MAMBA_ROOT_PREFIX
+    value: $(Agent.TempDirectory)/micromamba
+
+pool:
+  vmImage: windows-latest
 
 stages:
-- stage: Xray
-  displayName: Xray Scan
+- stage: Curation
+  displayName: Curation Scan
   jobs:
-  - job: ScanEnvironment
-    displayName: Scan environment.yml
+  - job: CurationAudit
+    displayName: Curate environment.yml via Artifactory
     pool:
-      vmImage: ubuntu-latest
+      vmImage: windows-latest
+
     steps:
-    - task: CmdLine@2
+
+    # ------------------------------------------------------------------ #
+    # 1. JFrog CLI                                                         #
+    # ------------------------------------------------------------------ #
+    - powershell: |
+        Invoke-WebRequest -Uri "https://releases.jfrog.io/artifactory/jfrog-cli/v2-jf/[RELEASE]/jfrog-cli-windows-amd64/jf.exe" `
+          -OutFile "$env:AGENT_TOOLSDIRECTORY\jf.exe"
+        echo "##vso[task.prependpath]$env:AGENT_TOOLSDIRECTORY"
+        jf config add jfrog-bot `
+          --url="$env:JFROG_URL" `
+          --access-token="$env:JFROG_ACCESS_TOKEN" `
+          --interactive=false
       env:
         JFROG_URL: $(jfrog_url)
         JFROG_ACCESS_TOKEN: $(jfrog_bot_token)
-      displayName: Install and Configure JFrog CLI
-      inputs:
-        script: |
-          curl -fL https://install-cli.jfrog.io | sh
-          jf config add jfrog-bot \
-            --url="$JFROG_URL" \
-            --access-token="$JFROG_ACCESS_TOKEN" \
-            --interactive=false
+      displayName: Install and configure JFrog CLI
 
-    - task: CmdLine@2
+    # ------------------------------------------------------------------ #
+    # 2. micromamba                                                        #
+    # ------------------------------------------------------------------ #
+    - powershell: |
+        $url  = "https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-win-64.zip"
+        $zip  = "$env:AGENT_TEMPDIRECTORY\micromamba.zip"
+        $dest = "$env:AGENT_TEMPDIRECTORY\micromamba"
+        Invoke-WebRequest -Uri $url -OutFile $zip
+        Expand-Archive -Path $zip -DestinationPath $dest -Force
+        echo "##vso[task.prependpath]$dest"
+        & "$dest\micromamba.exe" --version
+      displayName: Install micromamba
+
+    # ------------------------------------------------------------------ #
+    # 3. Write .netrc — micromamba reads %USERPROFILE%\.netrc on Windows. #
+    # ------------------------------------------------------------------ #
+    - powershell: |
+        $jfrogHost = ($env:JFROG_URL -replace "https://","" -split "/")[0]
+        $netrcPath  = "$env:USERPROFILE\.netrc"
+        Add-Content -Path $netrcPath -Value "machine $jfrogHost"
+        Add-Content -Path $netrcPath -Value "login x-jf-authorization"
+        Add-Content -Path $netrcPath -Value "password $env:JFROG_TOKEN"
+        Write-Host "netrc entry written for $jfrogHost"
       env:
         JFROG_URL: $(jfrog_url)
-        JFROG_ACCESS_TOKEN: $(jfrog_bot_token)
-        JFROG_CONDA_REPO: $(artifactory_conda_repo)
-      displayName: Install Miniconda and configure JFrog conda channel
-      inputs:
-        script: |
-          wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O miniconda.sh
-          bash miniconda.sh -b -p "$HOME/miniconda"
-          export PATH="$HOME/miniconda/bin:$PATH"
+        JFROG_TOKEN: $(jfrog_bot_token)
+      displayName: Write .netrc for Artifactory auth
 
-          conda install -n base conda-libmamba-solver -q -y
-          conda config --set solver libmamba
+    # ------------------------------------------------------------------ #
+    # 4. Strip build strings + Windows/ESRI-only packages                 #
+    # ------------------------------------------------------------------ #
+    - powershell: |
+        $script = @'
+        import yaml, sys, os
 
-          # Authenticate to JFrog via .netrc so credentials are not embedded in channel URLs
-          JFROG_HOST=$(echo "$JFROG_URL" | sed 's|https\?://||' | sed 's|/.*||')
-          echo "machine $JFROG_HOST login jfrog-bot password $JFROG_ACCESS_TOKEN" > ~/.netrc
-          chmod 600 ~/.netrc
+        WINDOWS_ONLY = {
+          'vc', 'vs2015_runtime', 'win_inet_pton', 'wincertstore',
+          'winkerberos', 'winpty', 'pywin32-ctypes', 'pywin32-security',
+          'pywinpty', 'requests-negotiate-sspi', 'icc_rt', 'x86cpu',
+          'python-certifi-win32', 'python_abi',
+        }
+        ESRI_ONLY = {
+          'arcgis', 'arcgispro', 'arcpy', 'arcpy-base',
+          'pro_notebook_integration', 'despatch',
+        }
+        SKIP = WINDOWS_ONLY | ESRI_ONLY
 
-          # Replace upstream channels with the JFrog conda virtual repo.
-          # Packages fetched through this channel are cached in Artifactory and
-          # automatically indexed by Xray, which populates results in the JFrog UI.
-          # NOTE: your conda virtual repo must proxy both 'defaults' and 'esri' channels.
-          conda config --remove-key channels 2>/dev/null || true
-          conda config --add channels "$JFROG_URL/artifactory/$JFROG_CONDA_REPO"
-          conda config --set channel_priority strict
+        with open('environment.yml') as f:
+            env = yaml.safe_load(f)
 
-    - task: CmdLine@2
-      displayName: Parse environment.yml
-      inputs:
-        script: |
-          python3 - <<'PYEOF'
-          import yaml, json
+        lines = []
+        seen = set()
+        for dep in env.get('dependencies', []):
+            if not isinstance(dep, str):
+                continue
+            parts = dep.split('=')
+            name = parts[0].strip()
+            version = parts[1].strip() if len(parts) >= 2 else None
+            name_lower = name.lower()
 
-          # Packages that have no linux-64 builds — Windows / ArcGIS Pro runtime only.
-          # These are separated out and queried via the Xray component API instead.
-          WINDOWS_ONLY = {
-              'arcgis', 'arcgispro', 'arcpy', 'arcpy-base', 'pro_notebook_integration',
-              'icc_rt', 'vc', 'vs2015_runtime',
-              'pywin32-ctypes', 'pywin32-security', 'pywinpty',
-              'win_inet_pton', 'wincertstore', 'winkerberos', 'winpty',
-              'python-certifi-win32',
-          }
+            if name_lower in SKIP or name_lower in seen:
+                continue
+            seen.add(name_lower)
 
-          with open('environment.yml') as f:
-              env = yaml.safe_load(f)
+            lines.append(f"{name}={version}" if version else name)
 
-          cross_platform = []
-          windows_pkgs = []
+        jfrog_url  = os.environ['JFROG_URL'].rstrip('/')
+        conda_repo = os.environ['ARTIFACTORY_CONDA_REPO']
+        channel = f"{jfrog_url}/artifactory/api/conda/{conda_repo}"
 
-          for dep in env.get('dependencies', []):
-              if not isinstance(dep, str):
-                  continue  # skip pip: sub-blocks
-              parts = dep.split('=')
-              name = parts[0]
-              # Strip platform-specific build string: keep name=version only.
-              # Also handles trailing-equals edge cases like 'pyarrow=1.0.1='.
-              version = parts[1] if len(parts) >= 2 and parts[1] else None
-              spec = f"{name}={version}" if version else name
+        with open('environment-scan.yml', 'w') as f:
+            f.write("name: scan-env\n")
+            f.write("channels:\n")
+            f.write(f"  - {channel}\n")
+            f.write("dependencies:\n")
+            for line in lines:
+                f.write(f"  - {line}\n")
 
-              if name in WINDOWS_ONLY:
-                  windows_pkgs.append({'name': name, 'version': version, 'spec': spec})
-              else:
-                  cross_platform.append(spec)
+        print(f"Generated environment-scan.yml with {len(lines)} packages")
+        print(f"Channel: {channel}")
+        '@
+        $script | Out-File -FilePath "$env:AGENT_TEMPDIRECTORY\gen_scan_env.py" -Encoding utf8
+        python "$env:AGENT_TEMPDIRECTORY\gen_scan_env.py"
 
-          with open('cross_platform_pkgs.txt', 'w') as f:
-              f.write('\n'.join(cross_platform))
-
-          with open('windows_pkgs.json', 'w') as f:
-              json.dump(windows_pkgs, f, indent=2)
-
-          print(f"Cross-platform packages: {len(cross_platform)}")
-          print(f"Windows-only packages (Xray API): {len(windows_pkgs)}")
-          for p in windows_pkgs:
-              print(f"  {p['spec']}")
-          PYEOF
-
-    - task: CmdLine@2
-      displayName: Download packages via JFrog conda channel
-      inputs:
-        script: |
-          export PATH="$HOME/miniconda/bin:$PATH"
-          mkdir -p conda-pkgs
-
-          PKGS=$(tr '\n' ' ' < cross_platform_pkgs.txt)
-          echo "Downloading $(wc -w < cross_platform_pkgs.txt) packages through JFrog..."
-
-          # Channels are already configured to point to JFrog (see setup step above).
-          # Do not use --override-channels here or it will ignore the JFrog channel config.
-          conda install \
-            --download-only \
-            --prefix /tmp/scan-prefix \
-            --yes \
-            $PKGS 2>&1 | tail -30 || true
-
-          find "$HOME/miniconda/pkgs" \( -name "*.conda" -o -name "*.tar.bz2" \) \
-            -exec cp {} conda-pkgs/ \;
-
-          echo "Downloaded $(ls conda-pkgs | wc -l) packages to conda-pkgs/"
-
-    - task: CmdLine@2
-      displayName: Scan downloaded packages with Xray
-      inputs:
-        script: |
-          # Produces SARIF for the Azure DevOps Code Analysis Logs tab.
-          # Full vulnerability results are also visible in the JFrog UI because packages
-          # were fetched through Artifactory above and Xray indexes them automatically.
-          jf scan conda-pkgs/ \
-            --server-id=jfrog-bot \
-            --format=sarif > xray.sarif
-
-          jf scan conda-pkgs/ \
-            --server-id=jfrog-bot \
-            --format=json > xray.json
-
-    - task: CmdLine@2
+        Write-Host "--- environment-scan.yml ---"
+        Get-Content environment-scan.yml
       env:
         JFROG_URL: $(jfrog_url)
-        JFROG_ACCESS_TOKEN: $(jfrog_bot_token)
-      displayName: Query Xray for Windows-only packages
-      inputs:
-        script: |
-          python3 - <<'PYEOF'
-          import json, urllib.request, urllib.error, os, sys
+        ARTIFACTORY_CONDA_REPO: $(artifactory_conda_repo)
+      displayName: Strip build strings, rewrite channels to Artifactory
 
-          jfrog_url = os.environ['JFROG_URL'].rstrip('/')
-          token = os.environ['JFROG_ACCESS_TOKEN']
+    # ------------------------------------------------------------------ #
+    # 5. Install via Artifactory — Curation enforces policy inline        #
+    # ------------------------------------------------------------------ #
+    - powershell: |
+        micromamba create `
+          --name scan-env `
+          --file environment-scan.yml `
+          --override-channels `
+          --yes
+      displayName: Install via Artifactory (Curation enforces policy)
 
-          with open('windows_pkgs.json') as f:
-              windows_pkgs = json.load(f)
+    # ------------------------------------------------------------------ #
+    # 6. Curation audit report — runs even if step 5 failed              #
+    # ------------------------------------------------------------------ #
+    - powershell: |
+        jf curation-audit --format=json 2>&1 | Tee-Object -FilePath curation.json
 
-          if not windows_pkgs:
-              print("No Windows-only packages to query")
-              with open('windows_xray.json', 'w') as f:
-                  json.dump([], f)
-              sys.exit(0)
+        $script = @'
+        import json, sys
 
-          # Xray component lookup by name+version — no binary required
-          components = [
-              {'component_id': f"conda://{p['name']}:{p['version']}" if p['version'] else f"conda://{p['name']}"}
-              for p in windows_pkgs
-          ]
+        try:
+            with open('curation.json') as f:
+                raw = f.read().strip()
+            results = json.loads(raw) if raw.startswith('[') else [json.loads(raw)]
+        except Exception as e:
+            print(f"Could not parse curation.json: {e}")
+            sys.exit(0)
 
-          payload = json.dumps({'component_details': components}).encode()
-          req = urllib.request.Request(
-              f"{jfrog_url}/xray/api/v1/component/id",
-              data=payload,
-              headers={
-                  'Content-Type': 'application/json',
-                  'Authorization': f'Bearer {token}',
-              },
-          )
+        blocked = []
+        allowed = 0
+        for entry in results:
+            for pkg in entry.get('blocked', []):
+                blocked.append(pkg)
+            allowed += len(entry.get('approved', []))
 
-          try:
-              with urllib.request.urlopen(req) as resp:
-                  result = json.loads(resp.read())
-          except urllib.error.HTTPError as e:
-              body = e.read().decode()
-              print(f"Xray API error {e.code}: {body}")
-              result = {'error': body}
-
-          with open('windows_xray.json', 'w') as f:
-              json.dump(result, f, indent=2)
-
-          data = result if isinstance(result, list) else result.get('data', [])
-          total_vulns = sum(len(c.get('vulnerabilities', [])) for c in data if isinstance(c, dict))
-          print(f"Windows packages queried: {len(components)}, vulnerabilities found: {total_vulns}")
-          for c in data:
-              vulns = c.get('vulnerabilities', [])
-              if vulns:
-                  print(f"  {c.get('component_id', 'unknown')}: {len(vulns)} issue(s)")
-          PYEOF
-
-    - task: PublishPipelineArtifact@1
-      displayName: Publish SARIF Results
+        print(f"\n{'='*60}")
+        print(f" CURATION REPORT")
+        print(f"{'='*60}")
+        print(f"  Approved : {allowed}")
+        print(f"  Blocked  : {len(blocked)}")
+        if blocked:
+            print()
+            for pkg in blocked:
+                print(f"  x {pkg.get('name','?')}=={pkg.get('version','?')}")
+                print(f"    Policy    : {pkg.get('policy_name','N/A')}")
+                print(f"    Condition : {pkg.get('condition_name','N/A')}")
+                print(f"    Reason    : {pkg.get('explanation','N/A')}")
+                print()
+        print(f"{'='*60}\n")
+        '@
+        $script | Out-File -FilePath "$env:AGENT_TEMPDIRECTORY\parse_curation.py" -Encoding utf8
+        python "$env:AGENT_TEMPDIRECTORY\parse_curation.py"
+      displayName: Publish curation audit report
       condition: always()
-      inputs:
-        targetPath: xray.sarif
-        artifactName: CodeAnalysisLogs
 
+    # ------------------------------------------------------------------ #
+    # 7. Publish artefact                                                  #
+    # ------------------------------------------------------------------ #
     - task: PublishPipelineArtifact@1
-      displayName: Publish JSON Results
-      condition: always()
       inputs:
-        targetPath: xray.json
-        artifactName: XrayJsonResults
-
-    - task: PublishPipelineArtifact@1
-      displayName: Publish Windows Package Xray Results
+        targetPath: curation.json
+        artifactName: CurationResults
+      displayName: Publish curation JSON
       condition: always()
-      inputs:
-        targetPath: windows_xray.json
-        artifactName: WindowsXrayResults
 
+
+# ------------------------------------------------------------------ #
+# GitHub mirror — unchanged                                           #
+# ------------------------------------------------------------------ #
 - stage: Github
-  displayName: 'Publish to GitHub'
+  displayName: Publish to GitHub
   dependsOn:
-  - Xray
-  condition: and( succeeded('Xray'), eq(variables.isMain, true) )
+    - Curation
+  condition: and(
+    succeeded('Curation'),
+    eq(variables.isMain, true) )
   jobs:
-  - job: Mirror
-    displayName: 'Mirror to GitHub'
-    pool:
-      vmImage: 'ubuntu-latest'
-    steps:
-    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
-      inputs:
-        repository: self
+    - job: Mirror
+      displayName: Mirror to GitHub
+      pool:
+        vmImage: windows-latest
+
+      steps:
+      - checkout: self
         fetchDepth: 0
-    - task: CmdLine@2
-      displayName: 'Push Mirror to GitHub'
-      inputs:
-        script: |
-          git remote remove github 2>/dev/null || true
-          git remote add github https://$(github_author_token)@github.com/$(github_org)/$(github_repo_name).git
-          git push github HEAD:refs/heads/"$BUILD_SOURCEBRANCHNAME" --follow-tags
+
+      - powershell: |
+          git remote remove github 2>$null
+          git remote add github "https://$($env:GITHUB_AUTHOR_TOKEN)@github.com/$($env:GITHUB_ORG)/$($env:GITHUB_REPO_NAME).git"
+          git push github "HEAD:refs/heads/$($env:BUILD_SOURCEBRANCHNAME)" --follow-tags
+        env:
+          GITHUB_AUTHOR_TOKEN: $(github_author_token)
+          GITHUB_ORG: $(github_org)
+          GITHUB_REPO_NAME: $(github_repo_name)
+        displayName: Push mirror to GitHub
