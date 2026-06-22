@@ -34,10 +34,12 @@ stages:
     # 1. JFrog CLI                                                         #
     # ------------------------------------------------------------------ #
     - powershell: |
-        Invoke-WebRequest -Uri "https://releases.jfrog.io/artifactory/jfrog-cli/v2-jf/[RELEASE]/jfrog-cli-windows-amd64/jf.exe" `
-          -OutFile "$env:AGENT_TOOLSDIRECTORY\jf.exe"
+        $jfDest = "$env:AGENT_TOOLSDIRECTORY\jf.exe"
+        Invoke-WebRequest `
+          -Uri "https://releases.jfrog.io/artifactory/jfrog-cli/v2-jf/[RELEASE]/jfrog-cli-windows-amd64/jf.exe" `
+          -OutFile $jfDest
         echo "##vso[task.prependpath]$env:AGENT_TOOLSDIRECTORY"
-        jf config add jfrog-bot `
+        & $jfDest config add jfrog-bot `
           --url="$env:JFROG_URL" `
           --access-token="$env:JFROG_ACCESS_TOKEN" `
           --interactive=false
