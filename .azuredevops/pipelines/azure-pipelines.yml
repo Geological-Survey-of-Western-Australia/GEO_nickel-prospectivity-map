@@ -156,24 +156,19 @@ stages:
           # --watches applies the gsrsd_watch policy (and its ignore rules/
           # exceptions) natively, so this only fails the build on violations
           # that aren't already excepted.
-          set +e
+          #
+          # Single scan (SARIF only) instead of two -- running twice for two
+          # output formats was doubling the wall time for no benefit, since
+          # each invocation re-indexes and re-polls independently rather than
+          # reusing the other's result. --threads raises scan concurrency
+          # above the client's default of 3 (visible in earlier runs as
+          # "[Thread 0]"/"[Thread 1]"/"[Thread 2]" in the indexer log), which
+          # should cut wall time roughly proportionally for ~254 packages.
           jf scan conda-pkgs/ \
             --server-id=jfrog-bot \
             --watches=gsrsd_watch \
+            --threads=10 \
             --format=sarif > xray.sarif
-          sarif_rc=$?
-
-          jf scan conda-pkgs/ \
-            --server-id=jfrog-bot \
-            --watches=gsrsd_watch \
-            --format=json > xray.json
-          json_rc=$?
-          set -e
-
-          if [ "$sarif_rc" -ne 0 ] || [ "$json_rc" -ne 0 ]; then
-            echo "Xray reported violations against watch 'gsrsd_watch' not covered by an existing exception."
-            exit 1
-          fi
 
     - task: PublishPipelineArtifact@1
       displayName: Publish SARIF Results
@@ -181,13 +176,6 @@ stages:
       inputs:
         targetPath: xray.sarif
         artifactName: CodeAnalysisLogs
-
-    - task: PublishPipelineArtifact@1
-      displayName: Publish JSON Results
-      condition: always()
-      inputs:
-        targetPath: xray.json
-        artifactName: XrayJsonResults
 
 - stage: Github
   displayName: 'Publish to GitHub'
