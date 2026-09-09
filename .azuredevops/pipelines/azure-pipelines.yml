@@ -289,6 +289,92 @@ stages:
         targetPath: xray.sarif
         artifactName: CodeAnalysisLogs
 
+    - task: CmdLine@2
+      env:
+        JFROG_URL: $(jfrog_url)
+        JFROG_ACCESS_TOKEN: $(jfrog_bot_token)
+        BUILD_NAME: $(Build.Repository.Name)
+        BUILD_NUMBER: $(Build.BuildId)
+      displayName: Publish build-info and trigger Xray build scan
+      condition: succeededOrFailed()
+      inputs:
+        script: |
+          python3 - <<'PYEOF'
+          # Gives these results a real, browsable home in JFrog: publishing a
+          # build (metadata only, no binaries) lets Xray treat it as a watched
+          # resource with its own scan history and violations view under
+          # gsrsd_watch -- the normal UI workflow the raw component-search
+          # calls above can't provide on their own.
+          #
+          # UNVERIFIED against this instance: the /xray/api/v1/scanBuild path,
+          # whether the scan is synchronous or needs polling, and whether Xray
+          # expects dependency ids as "name:version" for a "pypi" module type.
+          # Every response is printed in full so a wrong guess is visible
+          # rather than silently producing an empty/broken build record.
+          import yaml, json, os, sys, datetime, urllib.request, urllib.error
+
+          JFROG_URL = os.environ['JFROG_URL'].rstrip('/')
+          TOKEN = os.environ['JFROG_ACCESS_TOKEN']
+          BUILD_NAME = os.environ['BUILD_NAME']
+          BUILD_NUMBER = os.environ['BUILD_NUMBER']
+
+          def api_call(path, method='GET', payload=None):
+              data = json.dumps(payload).encode() if payload is not None else None
+              req = urllib.request.Request(
+                  f"{JFROG_URL}{path}",
+                  data=data,
+                  headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {TOKEN}'},
+                  method=method,
+              )
+              with urllib.request.urlopen(req) as resp:
+                  body = resp.read()
+                  return resp.status, (json.loads(body) if body else {})
+
+          with open('environment.yml') as f:
+              env = yaml.safe_load(f)
+
+          deps = []
+          seen = set()
+          for dep in env.get('dependencies', []):
+              if not isinstance(dep, str):
+                  continue
+              parts = dep.split('=')
+              name = parts[0]
+              version = parts[1] if len(parts) >= 2 and parts[1] else None
+              if not version or name in seen:
+                  continue
+              seen.add(name)
+              deps.append({'id': f"{name}:{version}", 'type': 'pypi'})
+
+          build_info = {
+              'version': '1.0.1',
+              'name': BUILD_NAME,
+              'number': BUILD_NUMBER,
+              'started': datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.000+0000'),
+              'modules': [{
+                  'id': 'environment.yml',
+                  'type': 'pypi',
+                  'dependencies': deps,
+              }],
+          }
+
+          print(f"Publishing build-info for {BUILD_NAME}/{BUILD_NUMBER} ({len(deps)} dependencies)...")
+          try:
+              status, resp = api_call('/artifactory/api/build', method='PUT', payload=build_info)
+              print(f"  build-publish -> HTTP {status}: {json.dumps(resp)[:500]}")
+          except urllib.error.HTTPError as e:
+              print(f"  build-publish -> HTTP {e.code}: {e.read().decode(errors='replace')[:1000]}")
+              sys.exit(0)  # visibility-only step; never fail the job over this
+
+          print(f"Triggering Xray build scan for {BUILD_NAME}/{BUILD_NUMBER}...")
+          try:
+              status, resp = api_call('/xray/api/v1/scanBuild', method='POST',
+                                       payload={'buildName': BUILD_NAME, 'buildNumber': BUILD_NUMBER})
+              print(f"  scanBuild -> HTTP {status}: {json.dumps(resp)[:1000]}")
+          except urllib.error.HTTPError as e:
+              print(f"  scanBuild -> HTTP {e.code}: {e.read().decode(errors='replace')[:1000]}")
+          PYEOF
+
 - stage: Github
   displayName: 'Publish to GitHub'
   dependsOn:
