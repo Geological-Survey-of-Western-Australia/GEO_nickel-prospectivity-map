@@ -35,10 +35,8 @@ stages:
           JFROG_URL = os.environ['JFROG_URL'].rstrip('/')
           TOKEN = os.environ['JFROG_ACCESS_TOKEN']
           WATCH_NAME = 'gsrsd_watch'
-          # Approximation of gsrsd_watch's real policy thresholds — this is a
-          # hand-maintained stand-in, not a live read of the policy itself, so
-          # if the policy's severity/license rules change in the JFrog UI this
-          # won't automatically follow. Revisit if that drifts.
+          # Hand-maintained approximation of gsrsd_watch's policy thresholds —
+          # not a live read of the policy, so keep in sync manually if it changes.
           BLOCKING_SEVERITIES = {'Critical', 'High'}
           BATCH_SIZE = 100
 
@@ -93,16 +91,12 @@ stages:
           #   {"artifacts": [{"general": {"component_id": "name:version"},
           #                    "issues": [...], "licenses": [...], "operational_risks": [...]}]}
           #
-          # Only the pypi:// component-id scheme returns real data on this
-          # instance. Xray's vulnerability database is indexed by publishing
-          # ecosystem, not by conda; conda:// and generic:// were confirmed
-          # (across all 254 packages, not just a sample) to always come back
-          # with issues: [] and a bogus "Unknown" license, including for
-          # packages with well-documented real CVEs and licenses. Since most
-          # of environment.yml's packages are conda-packaged mirrors of PyPI
-          # projects, pypi:// is what actually finds anything; genuinely
-          # conda/OS-only packages (vc, openssl, sqlite, ...) just won't match
-          # under any scheme without a real binary for Xray to fingerprint.
+          # Uses pypi:// component ids: Xray's vulnerability database is
+          # indexed by publishing ecosystem, and most of environment.yml's
+          # packages are conda-packaged mirrors of PyPI projects. conda:// and
+          # generic:// never return real data (no binary for Xray to
+          # fingerprint), so genuinely conda/OS-only packages (vc, openssl,
+          # sqlite, ...) just won't match under any scheme here.
           components_data = []
           for i in range(0, len(packages), BATCH_SIZE):
               batch = packages[i:i + BATCH_SIZE]
@@ -124,12 +118,10 @@ stages:
           print(f"Xray returned data for {len(components_data)} component lookups")
 
           # --- 3. Fetch ignore rules for gsrsd_watch ------------------------
-          # The endpoint itself and its top-level 'data' wrapper are confirmed
-          # ({"data": [], "total_count": 0} with none configured yet), but the
-          # per-rule field names below (watches/watch_names, vulnerabilities/
-          # cves) are still guesses — there's been nothing non-empty to check
-          # them against. raw_ignore_rules in xray-results.json preserves the
-          # real shape once a rule actually exists, to confirm or fix them.
+          # Per-rule field names (watches/watch_names, vulnerabilities/cves)
+          # are best-effort guesses, not yet checked against a real rule.
+          # raw_ignore_rules in xray-results.json has the actual shape once
+          # one exists — fix the field names here if it doesn't match.
           try:
               ignore_rules_raw = api_call('/xray/api/v1/ignore_rules')
           except urllib.error.HTTPError as e:
@@ -165,11 +157,9 @@ stages:
           print(f"Loaded {len(ignored_cves)} actively-ignored CVE(s) for watch '{WATCH_NAME}'")
 
           # --- 4. Filter exceptions, apply severity threshold ---------------
-          # issue/severity/summary field names confirmed correct against real
-          # data (76 genuine CVEs matched on the first successful run, e.g.
-          # Pillow, Jinja2, cryptography, Tornado). issue_cve() also handles a
-          # nested 'cves' list as a fallback in case some issue types use it
-          # instead of a flat 'cve' field.
+          # issue_cve() handles a nested 'cves' list as a fallback in case
+          # some issue types use it instead of a flat 'cve' field. Issues
+          # with no CVE at all (Xray-native advisories) fall back to issue_id.
           def issue_cve(issue):
               cves = issue.get('cves') or []
               for c in cves:
@@ -303,14 +293,12 @@ stages:
           # Gives these results a real, browsable home in JFrog: publishing a
           # build (metadata only, no binaries) lets Xray treat it as a watched
           # resource with its own scan history and violations view under
-          # gsrsd_watch -- the normal UI workflow the raw component-search
-          # calls above can't provide on their own.
+          # gsrsd_watch, unlike the raw component-search calls above.
           #
-          # UNVERIFIED against this instance: the /xray/api/v1/scanBuild path,
-          # whether the scan is synchronous or needs polling, and whether Xray
-          # expects dependency ids as "name:version" for a "pypi" module type.
-          # Every response is printed in full so a wrong guess is visible
-          # rather than silently producing an empty/broken build record.
+          # New build names must be opted into Xray indexing once, manually,
+          # before scanBuild does anything (JFrog UI: select the build under
+          # Artifactory > Builds > Add/Remove to Xray > Build). Until that's
+          # done, scanBuild succeeds but reports the build as not indexed.
           import yaml, json, os, sys, datetime, urllib.request, urllib.error
 
           JFROG_URL = os.environ['JFROG_URL'].rstrip('/')
@@ -350,7 +338,7 @@ stages:
               'version': '1.0.1',
               'name': BUILD_NAME,
               'number': BUILD_NUMBER,
-              'started': datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.000+0000'),
+              'started': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000+0000'),
               'modules': [{
                   'id': 'environment.yml',
                   'type': 'pypi',
