@@ -116,6 +116,11 @@ stages:
           export PATH="$HOME/miniconda/bin:$PATH"
           mkdir -p conda-pkgs
 
+          # The Miniconda bootstrap + libmamba-solver install (previous step) already
+          # left their own packages in the local cache (anaconda-auth, conda-rattler-solver,
+          # etc.). Clear it so the find below only picks up what we request here.
+          rm -rf "$HOME/miniconda/pkgs"/*
+
           download() {
             local pkgfile=$1
             local pkgs
