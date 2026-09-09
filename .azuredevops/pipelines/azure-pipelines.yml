@@ -68,10 +68,11 @@ stages:
       inputs:
         script: |
           python3 - <<'PYEOF'
-          import yaml, json
+          import yaml
 
-          # Packages that have no linux-64 builds — Windows / ArcGIS Pro runtime only.
-          # These are separated out and queried via the Xray component API instead.
+          # Packages with no linux-64 build — Windows / ArcGIS Pro runtime only.
+          # Fetched via the win-64 conda subdir instead (see download step) so
+          # Xray still gets a real binary to fingerprint.
           WINDOWS_ONLY = {
               'arcgis', 'arcgispro', 'arcpy', 'arcpy-base', 'pro_notebook_integration',
               'icc_rt', 'vc', 'vs2015_runtime',
@@ -84,7 +85,7 @@ stages:
               env = yaml.safe_load(f)
 
           cross_platform = []
-          windows_pkgs = []
+          windows_only = []
 
           for dep in env.get('dependencies', []):
               if not isinstance(dep, str):
@@ -96,21 +97,16 @@ stages:
               version = parts[1] if len(parts) >= 2 and parts[1] else None
               spec = f"{name}={version}" if version else name
 
-              if name in WINDOWS_ONLY:
-                  windows_pkgs.append({'name': name, 'version': version, 'spec': spec})
-              else:
-                  cross_platform.append(spec)
+              (windows_only if name in WINDOWS_ONLY else cross_platform).append(spec)
 
           with open('cross_platform_pkgs.txt', 'w') as f:
               f.write('\n'.join(cross_platform))
 
-          with open('windows_pkgs.json', 'w') as f:
-              json.dump(windows_pkgs, f, indent=2)
+          with open('windows_pkgs.txt', 'w') as f:
+              f.write('\n'.join(windows_only))
 
           print(f"Cross-platform packages: {len(cross_platform)}")
-          print(f"Windows-only packages (Xray API): {len(windows_pkgs)}")
-          for p in windows_pkgs:
-              print(f"  {p['spec']}")
+          print(f"Windows-only packages (win-64 subdir): {len(windows_only)}")
           PYEOF
 
     - task: CmdLine@2
@@ -120,16 +116,27 @@ stages:
           export PATH="$HOME/miniconda/bin:$PATH"
           mkdir -p conda-pkgs
 
-          PKGS=$(tr '\n' ' ' < cross_platform_pkgs.txt)
-          echo "Downloading $(wc -w < cross_platform_pkgs.txt) packages through JFrog..."
+          download() {
+            local pkgfile=$1
+            local pkgs
+            pkgs=$(tr '\n' ' ' < "$pkgfile")
+            [ -z "$pkgs" ] && return 0
+            echo "Downloading $(wc -w < "$pkgfile") packages (CONDA_SUBDIR=${CONDA_SUBDIR:-native}) through JFrog..."
+            # Channels are already configured to point to JFrog (see setup step above).
+            # Do not use --override-channels here or it will ignore the JFrog channel config.
+            conda install \
+              --download-only \
+              --prefix /tmp/scan-prefix \
+              --yes \
+              $pkgs 2>&1 | tail -30 || true
+          }
 
-          # Channels are already configured to point to JFrog (see setup step above).
-          # Do not use --override-channels here or it will ignore the JFrog channel config.
-          conda install \
-            --download-only \
-            --prefix /tmp/scan-prefix \
-            --yes \
-            $PKGS 2>&1 | tail -30 || true
+          download cross_platform_pkgs.txt
+
+          # Windows/ArcGIS-only packages have no linux-64 build; force the win-64
+          # subdir so conda fetches a real Windows binary instead. --download-only
+          # never links or executes it, so this is safe from the Ubuntu agent.
+          CONDA_SUBDIR=win-64 download windows_pkgs.txt
 
           find "$HOME/miniconda/pkgs" \( -name "*.conda" -o -name "*.tar.bz2" \) \
             -exec cp {} conda-pkgs/ \;
@@ -143,71 +150,27 @@ stages:
           # Produces SARIF for the Azure DevOps Code Analysis Logs tab.
           # Full vulnerability results are also visible in the JFrog UI because packages
           # were fetched through Artifactory above and Xray indexes them automatically.
+          #
+          # --watches applies the gsrsd_watch policy (and its ignore rules/exceptions),
+          # so this only fails the build on violations that aren't already excepted.
+          set +e
           jf scan conda-pkgs/ \
             --server-id=jfrog-bot \
+            --watches=gsrsd_watch \
             --format=sarif > xray.sarif
+          sarif_rc=$?
 
           jf scan conda-pkgs/ \
             --server-id=jfrog-bot \
+            --watches=gsrsd_watch \
             --format=json > xray.json
+          json_rc=$?
+          set -e
 
-    - task: CmdLine@2
-      env:
-        JFROG_URL: $(jfrog_url)
-        JFROG_ACCESS_TOKEN: $(jfrog_bot_token)
-      displayName: Query Xray for Windows-only packages
-      inputs:
-        script: |
-          python3 - <<'PYEOF'
-          import json, urllib.request, urllib.error, os, sys
-
-          jfrog_url = os.environ['JFROG_URL'].rstrip('/')
-          token = os.environ['JFROG_ACCESS_TOKEN']
-
-          with open('windows_pkgs.json') as f:
-              windows_pkgs = json.load(f)
-
-          if not windows_pkgs:
-              print("No Windows-only packages to query")
-              with open('windows_xray.json', 'w') as f:
-                  json.dump([], f)
-              sys.exit(0)
-
-          # Xray component lookup by name+version — no binary required
-          components = [
-              {'component_id': f"conda://{p['name']}:{p['version']}" if p['version'] else f"conda://{p['name']}"}
-              for p in windows_pkgs
-          ]
-
-          payload = json.dumps({'component_details': components}).encode()
-          req = urllib.request.Request(
-              f"{jfrog_url}/xray/api/v1/component/id",
-              data=payload,
-              headers={
-                  'Content-Type': 'application/json',
-                  'Authorization': f'Bearer {token}',
-              },
-          )
-
-          try:
-              with urllib.request.urlopen(req) as resp:
-                  result = json.loads(resp.read())
-          except urllib.error.HTTPError as e:
-              body = e.read().decode()
-              print(f"Xray API error {e.code}: {body}")
-              result = {'error': body}
-
-          with open('windows_xray.json', 'w') as f:
-              json.dump(result, f, indent=2)
-
-          data = result if isinstance(result, list) else result.get('data', [])
-          total_vulns = sum(len(c.get('vulnerabilities', [])) for c in data if isinstance(c, dict))
-          print(f"Windows packages queried: {len(components)}, vulnerabilities found: {total_vulns}")
-          for c in data:
-              vulns = c.get('vulnerabilities', [])
-              if vulns:
-                  print(f"  {c.get('component_id', 'unknown')}: {len(vulns)} issue(s)")
-          PYEOF
+          if [ "$sarif_rc" -ne 0 ] || [ "$json_rc" -ne 0 ]; then
+            echo "Xray reported violations against watch 'gsrsd_watch' not covered by an existing exception."
+            exit 1
+          fi
 
     - task: PublishPipelineArtifact@1
       displayName: Publish SARIF Results
@@ -222,13 +185,6 @@ stages:
       inputs:
         targetPath: xray.json
         artifactName: XrayJsonResults
-
-    - task: PublishPipelineArtifact@1
-      displayName: Publish Windows Package Xray Results
-      condition: always()
-      inputs:
-        targetPath: windows_xray.json
-        artifactName: WindowsXrayResults
 
 - stage: Github
   displayName: 'Publish to GitHub'
