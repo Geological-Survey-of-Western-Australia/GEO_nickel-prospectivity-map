@@ -59,16 +59,20 @@ stages:
           JFROG_HOST=$(echo "$JFROG_URL" | sed 's|https\?://||' | sed 's|/.*||')
           JFROG_CHANNEL_URL="https://${JFROG_BOT_USERNAME}:${JFROG_ACCESS_TOKEN}@${JFROG_HOST}/artifactory/$JFROG_CONDA_REPO"
 
-          # Replace upstream channels with the JFrog conda virtual repo, explicitly
-          # dropping the implicit 'defaults' fallback so packages only ever resolve
-          # through JFrog. Packages fetched through this channel are cached in
-          # Artifactory and automatically indexed by Xray, which populates results
-          # in the JFrog UI.
+          # Replace upstream channels with the JFrog conda virtual repo. Write
+          # .condarc directly rather than `conda config --add/--remove` — the
+          # implicit 'defaults' fallback isn't actually present as a literal
+          # entry to remove, so `--remove channels defaults` silently no-ops
+          # and 'defaults' keeps leaking back in. Packages fetched through this
+          # channel are cached in Artifactory and automatically indexed by
+          # Xray, which populates results in the JFrog UI.
           # NOTE: your conda virtual repo must proxy both 'defaults' and 'esri' channels.
-          conda config --remove channels defaults 2>/dev/null || true
-          conda config --add channels "$JFROG_CHANNEL_URL"
-          conda config --set channel_priority strict
-          chmod 600 "$HOME/.condarc" 2>/dev/null || true
+          {
+            echo "channels:"
+            echo "  - $JFROG_CHANNEL_URL"
+            echo "channel_priority: strict"
+          } > "$HOME/.condarc"
+          chmod 600 "$HOME/.condarc"
 
     - task: CmdLine@2
       displayName: Parse environment.yml
@@ -140,8 +144,13 @@ stages:
             echo "Downloading $(wc -w < "$pkgfile") packages (CONDA_SUBDIR=${CONDA_SUBDIR:-native}) through JFrog..."
             # Channels are already configured to point to JFrog (see setup step above).
             # Do not use --override-channels here or it will ignore the JFrog channel config.
+            # environment.yml is a full `conda env export`, so every transitive
+            # dependency is already pinned explicitly — there's nothing left to
+            # solve. --no-deps skips the dependency-graph solve entirely, which
+            # is what was blowing past the hosted agent's memory limit.
             conda install \
               --download-only \
+              --no-deps \
               --prefix /tmp/scan-prefix \
               --yes \
               $pkgs 2>&1 | tail -30 || true
