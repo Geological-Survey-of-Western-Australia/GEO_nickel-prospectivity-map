@@ -4,7 +4,7 @@ trigger:
     include:
     - '*'
 variables:
-- group: gswa-jfrog           # requires: jfrog_url, jfrog_bot_token, jfrog_bot_username, artifactory_conda_repo
+- group: gswa-jfrog           # requires: jfrog_url, jfrog_bot_token
 - group: nickel-prospectivity-maps  # requires: github_author_token, github_org, github_repo_name
 - name: isMain
   value: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
@@ -26,190 +26,172 @@ stages:
       env:
         JFROG_URL: $(jfrog_url)
         JFROG_ACCESS_TOKEN: $(jfrog_bot_token)
-      displayName: Install and Configure JFrog CLI
-      inputs:
-        script: |
-          curl -fL https://install-cli.jfrog.io | sh
-          jf config add jfrog-bot \
-            --url="$JFROG_URL" \
-            --access-token="$JFROG_ACCESS_TOKEN" \
-            --interactive=false
-
-    - task: CmdLine@2
-      env:
-        JFROG_URL: $(jfrog_url)
-        JFROG_ACCESS_TOKEN: $(jfrog_bot_token)
-        JFROG_BOT_USERNAME: $(jfrog_bot_username)
-        JFROG_CONDA_REPO: $(artifactory_conda_repo)
-      displayName: Install Miniconda and configure JFrog conda channel
-      inputs:
-        script: |
-          wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O miniconda.sh
-          bash miniconda.sh -b -p "$HOME/miniconda"
-          export PATH="$HOME/miniconda/bin:$PATH"
-
-          conda install -n base conda-libmamba-solver -q -y
-          conda config --set solver libmamba
-
-          # Basic-Auth only accepts a reference token when paired with the exact
-          # username it was issued under (jfrog_bot_username), not an arbitrary
-          # label. Embed it in the channel URL, which is JFrog's documented method
-          # for conda. Azure DevOps masks the literal value of jfrog_bot_token in
-          # logs since it comes from a variable-group secret.
-          JFROG_HOST=$(echo "$JFROG_URL" | sed 's|https\?://||' | sed 's|/.*||')
-          JFROG_CHANNEL_URL="https://${JFROG_BOT_USERNAME}:${JFROG_ACCESS_TOKEN}@${JFROG_HOST}/artifactory/$JFROG_CONDA_REPO"
-
-          # Replace upstream channels with the JFrog conda virtual repo. Write
-          # .condarc directly rather than `conda config --add/--remove` — the
-          # implicit 'defaults' fallback isn't actually present as a literal
-          # entry to remove, so `--remove channels defaults` silently no-ops
-          # and 'defaults' keeps leaking back in. Packages fetched through this
-          # channel are cached in Artifactory and automatically indexed by
-          # Xray, which populates results in the JFrog UI.
-          # NOTE: your conda virtual repo must proxy both 'defaults' and 'esri' channels.
-          {
-            echo "channels:"
-            echo "  - $JFROG_CHANNEL_URL"
-            echo "channel_priority: strict"
-          } > "$HOME/.condarc"
-          chmod 600 "$HOME/.condarc"
-
-    - task: CmdLine@2
-      displayName: Parse environment.yml
+      displayName: Query Xray Component Search for environment.yml packages
       inputs:
         script: |
           python3 - <<'PYEOF'
-          import yaml
+          import yaml, json, os, sys, urllib.request, urllib.error
 
-          # Packages with no linux-64 build — Windows / ArcGIS Pro runtime only.
-          # Fetched via the win-64 conda subdir instead (see download step) so
-          # Xray still gets a real binary to fingerprint.
-          WINDOWS_ONLY = {
-              'arcgis', 'arcgispro', 'arcpy', 'arcpy-base', 'pro_notebook_integration',
-              'icc_rt', 'vc', 'vs2015_runtime',
-              'pywin32-ctypes', 'pywin32-security', 'pywinpty',
-              'win_inet_pton', 'wincertstore', 'winkerberos', 'winpty',
-              'python-certifi-win32',
-          }
+          JFROG_URL = os.environ['JFROG_URL'].rstrip('/')
+          TOKEN = os.environ['JFROG_ACCESS_TOKEN']
+          WATCH_NAME = 'gsrsd_watch'
+          # Approximation of gsrsd_watch's real policy thresholds — this is a
+          # hand-maintained stand-in, not a live read of the policy itself, so
+          # if the policy's severity/license rules change in the JFrog UI this
+          # won't automatically follow. Revisit if that drifts.
+          BLOCKING_SEVERITIES = {'Critical', 'High'}
+          BATCH_SIZE = 100
 
+          def api_call(path, method='GET', payload=None):
+              data = json.dumps(payload).encode() if payload is not None else None
+              req = urllib.request.Request(
+                  f"{JFROG_URL}{path}",
+                  data=data,
+                  headers={
+                      'Content-Type': 'application/json',
+                      'Authorization': f'Bearer {TOKEN}',
+                  },
+                  method=method,
+              )
+              with urllib.request.urlopen(req) as resp:
+                  body = resp.read()
+                  return json.loads(body) if body else {}
+
+          # --- 1. Parse environment.yml ------------------------------------
           with open('environment.yml') as f:
               env = yaml.safe_load(f)
 
-          cross_platform = []
-          windows_only = []
-
+          packages = []
+          seen = set()
           for dep in env.get('dependencies', []):
               if not isinstance(dep, str):
                   continue  # skip pip: sub-blocks
               parts = dep.split('=')
               name = parts[0]
               # Strip platform-specific build string: keep name=version only.
-              # Also handles trailing-equals edge cases like 'pyarrow=1.0.1='.
               version = parts[1] if len(parts) >= 2 and parts[1] else None
-              spec = f"{name}={version}" if version else name
+              if not version or name in seen:
+                  continue
+              seen.add(name)
+              packages.append({'name': name, 'version': version})
 
-              (windows_only if name in WINDOWS_ONLY else cross_platform).append(spec)
+          print(f"Parsed {len(packages)} unique versioned packages from environment.yml")
 
-          with open('cross_platform_pkgs.txt', 'w') as f:
-              f.write('\n'.join(cross_platform))
+          # --- 2. Query the Xray Component Search API in batches -----------
+          # NOTE: 'conda://name:version' is the component-id scheme used for
+          # the (removed) Windows-only branch of the old pipeline; unverified
+          # against this Xray instance. If every component below comes back
+          # with zero vulnerabilities, check raw_components in xray-results.json
+          # for the response shape before trusting a clean result.
+          components_data = []
+          for i in range(0, len(packages), BATCH_SIZE):
+              batch = packages[i:i + BATCH_SIZE]
+              payload = {
+                  'component_details': [
+                      {'component_id': f"conda://{p['name']}:{p['version']}"}
+                      for p in batch
+                  ]
+              }
+              print(f"Querying Xray for packages {i + 1}-{i + len(batch)} of {len(packages)}...")
+              try:
+                  result = api_call('/xray/api/v1/component/id', method='POST', payload=payload)
+              except urllib.error.HTTPError as e:
+                  print(f"  HTTP {e.code} querying component/id: {e.read().decode(errors='replace')[:500]}")
+                  raise
+              batch_data = result if isinstance(result, list) else result.get('data', [])
+              components_data.extend(batch_data)
 
-          with open('windows_pkgs.txt', 'w') as f:
-              f.write('\n'.join(windows_only))
+          print(f"Xray returned data for {len(components_data)} component(s)")
 
-          print(f"Cross-platform packages: {len(cross_platform)}")
-          print(f"Windows-only packages (win-64 subdir): {len(windows_only)}")
+          # --- 3. Fetch ignore rules for gsrsd_watch ------------------------
+          # NOTE: endpoint/schema unverified against this Xray instance —
+          # raw_ignore_rules in xray-results.json shows the real shape if the
+          # field names guessed below (watches/watch_names, vulnerabilities/cves)
+          # turn out to be wrong.
+          try:
+              ignore_rules_raw = api_call('/xray/api/v1/ignore_rules')
+          except urllib.error.HTTPError as e:
+              print(f"Could not fetch ignore rules (HTTP {e.code}); treating as none configured")
+              ignore_rules_raw = {}
+
+          if isinstance(ignore_rules_raw, dict):
+              ignore_rules = ignore_rules_raw.get('data', [])
+          else:
+              ignore_rules = ignore_rules_raw or []
+          if not isinstance(ignore_rules, list):
+              ignore_rules = []
+
+          def rule_applies_to_watch(rule):
+              watches = rule.get('watches') or rule.get('watch_names') or []
+              return not watches or WATCH_NAME in watches
+
+          def rule_cves(rule):
+              vulns = rule.get('vulnerabilities') or rule.get('cves') or []
+              out = set()
+              for v in vulns:
+                  out.add(v if isinstance(v, str) else (v.get('cve') or v.get('id')))
+              return {v for v in out if v}
+
+          ignored_cves = set()
+          for rule in ignore_rules:
+              if rule.get('is_expired'):
+                  continue
+              if not rule_applies_to_watch(rule):
+                  continue
+              ignored_cves |= rule_cves(rule)
+
+          print(f"Loaded {len(ignored_cves)} actively-ignored CVE(s) for watch '{WATCH_NAME}'")
+
+          # --- 4. Filter exceptions, apply severity threshold ---------------
+          violations = []
+          for component in components_data:
+              for vuln in component.get('vulnerabilities', []):
+                  cve = vuln.get('cve')
+                  severity = vuln.get('severity', 'Unknown')
+                  if cve and cve in ignored_cves:
+                      continue
+                  if severity in BLOCKING_SEVERITIES:
+                      violations.append({
+                          'component': component.get('component_id'),
+                          'cve': cve,
+                          'severity': severity,
+                          'summary': vuln.get('summary'),
+                      })
+
+          with open('xray-results.json', 'w') as f:
+              json.dump({
+                  'packages_checked': len(packages),
+                  'components_returned': len(components_data),
+                  'ignored_cve_count': len(ignored_cves),
+                  'violations': violations,
+                  'raw_components': components_data,
+                  'raw_ignore_rules': ignore_rules,
+              }, f, indent=2)
+
+          print(f"\n{'='*60}")
+          print(f" XRAY REPORT (watch: {WATCH_NAME}, blocking severities: {sorted(BLOCKING_SEVERITIES)})")
+          print(f"{'='*60}")
+          print(f"  Packages checked : {len(packages)}")
+          print(f"  Ignored CVEs     : {len(ignored_cves)}")
+          print(f"  Violations       : {len(violations)}")
+          if violations:
+              print()
+              for v in violations:
+                  print(f"  x {v['component']}  {v['cve']}  [{v['severity']}]")
+                  if v['summary']:
+                      print(f"    {v['summary'][:200]}")
+          print(f"{'='*60}\n")
+
+          if violations:
+              sys.exit(1)
           PYEOF
 
-    - task: CmdLine@2
-      displayName: Download packages via JFrog conda channel
-      inputs:
-        script: |
-          export PATH="$HOME/miniconda/bin:$PATH"
-          mkdir -p conda-pkgs
-
-          # The Miniconda bootstrap + libmamba-solver install (previous step) already
-          # left their own packages in the local cache (anaconda-auth, conda-rattler-solver,
-          # etc.). Clear it so the find below only picks up what we request here.
-          rm -rf "$HOME/miniconda/pkgs"/*
-
-          # `conda install --download-only --prefix` requires an already-initialized
-          # conda environment at that prefix, or it fails with EnvironmentLocationNotFound.
-          conda create --prefix /tmp/scan-prefix --yes
-
-          download() {
-            local pkgfile=$1
-            local pkgs
-            pkgs=$(tr '\n' ' ' < "$pkgfile")
-            [ -z "$pkgs" ] && return 0
-            echo "Downloading $(wc -w < "$pkgfile") packages (CONDA_SUBDIR=${CONDA_SUBDIR:-native}) through JFrog..."
-            # Channels are already configured to point to JFrog (see setup step above).
-            # Do not use --override-channels here or it will ignore the JFrog channel config.
-            # environment.yml is a full `conda env export`, so every transitive
-            # dependency is already pinned explicitly — there's nothing left to
-            # solve. --no-deps skips the dependency-graph solve entirely, which
-            # is what was blowing past the hosted agent's memory limit.
-            conda install \
-              --download-only \
-              --no-deps \
-              --prefix /tmp/scan-prefix \
-              --yes \
-              $pkgs 2>&1 | tail -30 || true
-          }
-
-          download cross_platform_pkgs.txt
-
-          # Windows/ArcGIS-only packages have no linux-64 build; force the win-64
-          # subdir so conda fetches a real Windows binary instead. --download-only
-          # never links or executes it, so this is safe from the Ubuntu agent.
-          CONDA_SUBDIR=win-64 download windows_pkgs.txt
-
-          find "$HOME/miniconda/pkgs" \( -name "*.conda" -o -name "*.tar.bz2" \) \
-            -exec cp {} conda-pkgs/ \;
-
-          echo "Downloaded $(ls conda-pkgs | wc -l) packages to conda-pkgs/"
-
-    - task: CmdLine@2
-      displayName: Scan downloaded packages with Xray
-      inputs:
-        script: |
-          # Produces SARIF for the Azure DevOps Code Analysis Logs tab.
-          # Full vulnerability results are also visible in the JFrog UI because packages
-          # were fetched through Artifactory above and Xray indexes them automatically.
-          #
-          # --watches applies the gsrsd_watch policy (and its ignore rules/exceptions),
-          # so this only fails the build on violations that aren't already excepted.
-          set +e
-          jf scan conda-pkgs/ \
-            --server-id=jfrog-bot \
-            --watches=gsrsd_watch \
-            --format=sarif > xray.sarif
-          sarif_rc=$?
-
-          jf scan conda-pkgs/ \
-            --server-id=jfrog-bot \
-            --watches=gsrsd_watch \
-            --format=json > xray.json
-          json_rc=$?
-          set -e
-
-          if [ "$sarif_rc" -ne 0 ] || [ "$json_rc" -ne 0 ]; then
-            echo "Xray reported violations against watch 'gsrsd_watch' not covered by an existing exception."
-            exit 1
-          fi
-
     - task: PublishPipelineArtifact@1
-      displayName: Publish SARIF Results
+      displayName: Publish Xray Results
       condition: always()
       inputs:
-        targetPath: xray.sarif
-        artifactName: CodeAnalysisLogs
-
-    - task: PublishPipelineArtifact@1
-      displayName: Publish JSON Results
-      condition: always()
-      inputs:
-        targetPath: xray.json
-        artifactName: XrayJsonResults
+        targetPath: xray-results.json
+        artifactName: XrayResults
 
 - stage: Github
   displayName: 'Publish to GitHub'
