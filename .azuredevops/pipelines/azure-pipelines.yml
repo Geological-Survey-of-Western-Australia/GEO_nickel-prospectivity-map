@@ -4,7 +4,7 @@ trigger:
     include:
     - '*'
 variables:
-- group: gswa-jfrog           # requires: jfrog_url, jfrog_bot_token
+- group: gswa-jfrog           # requires: jfrog_url, jfrog_bot_token, artifactory_conda_repo
 - group: nickel-prospectivity-maps  # requires: github_author_token, github_org, github_repo_name
 - name: isMain
   value: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
@@ -26,49 +26,55 @@ stages:
       env:
         JFROG_URL: $(jfrog_url)
         JFROG_ACCESS_TOKEN: $(jfrog_bot_token)
-      displayName: Query Xray Component Search for environment.yml packages
+      displayName: Install and Configure JFrog CLI
+      inputs:
+        script: |
+          curl -fL https://install-cli.jfrog.io | sh
+          jf config add jfrog-bot \
+            --url="$JFROG_URL" \
+            --access-token="$JFROG_ACCESS_TOKEN" \
+            --interactive=false
+
+    - task: CmdLine@2
+      env:
+        JFROG_URL: $(jfrog_url)
+        JFROG_ACCESS_TOKEN: $(jfrog_bot_token)
+        JFROG_CONDA_REPO: $(artifactory_conda_repo)
+      displayName: Download real conda packages via repodata lookup
       inputs:
         script: |
           python3 - <<'PYEOF'
+          # Fetches real package binaries so Xray has something to fingerprint
+          # (Component Search's checksum-free identity lookup only finds data
+          # for pypi:// coordinates, not conda:// -- see docs/xray-conda-coverage-proposal.md).
+          #
+          # Deliberately avoids `conda install`: conda has to fetch and parse
+          # the full repodata.json for every proxied channel to do ANY install
+          # operation, and that index parsing (not the dependency solve) is
+          # what exhausted the hosted agent's memory previously. Since
+          # environment.yml already pins every exact name+version, there's
+          # nothing to resolve -- fetch each subdir's repodata.json directly
+          # with plain Python (a dict lookup, not conda/libmamba's solver
+          # machinery) to find the right filename, then download just the
+          # ~254 needed files directly.
           import yaml, json, os, sys, urllib.request, urllib.error
 
           JFROG_URL = os.environ['JFROG_URL'].rstrip('/')
           TOKEN = os.environ['JFROG_ACCESS_TOKEN']
-          WATCH_NAME = 'gsrsd_watch'
-          # Hand-maintained approximation of gsrsd_watch's policy thresholds —
-          # not a live read of the policy, so keep in sync manually if it changes.
-          BLOCKING_SEVERITIES = {'Critical', 'High'}
-          BATCH_SIZE = 100
+          CONDA_REPO = os.environ['JFROG_CONDA_REPO']
+          SUBDIRS = ['noarch', 'linux-64', 'win-64']
+          TIMEOUT = 300
 
-          def api_call(path, method='GET', payload=None):
-              data = json.dumps(payload).encode() if payload is not None else None
+          def get(path):
               req = urllib.request.Request(
                   f"{JFROG_URL}{path}",
-                  data=data,
-                  headers={
-                      'Content-Type': 'application/json',
-                      'Authorization': f'Bearer {TOKEN}',
-                  },
-                  method=method,
+                  headers={'Authorization': f'Bearer {TOKEN}'},
               )
-              with urllib.request.urlopen(req) as resp:
-                  body = resp.read()
-                  return json.loads(body) if body else {}
+              with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                  return resp.read()
 
-          # --- 1. Parse environment.yml ------------------------------------
           with open('environment.yml') as f:
-              env_lines = f.readlines()
-          env = yaml.safe_load(''.join(env_lines))
-
-          # Line numbers for SARIF locations — yaml.safe_load doesn't keep
-          # them, so match each dependency string back to its source line.
-          line_for_name = {}
-          for lineno, line in enumerate(env_lines, start=1):
-              stripped = line.strip()
-              if stripped.startswith('- '):
-                  dep_name = stripped[2:].split('=')[0].strip()
-                  if dep_name:
-                      line_for_name.setdefault(dep_name, lineno)
+              env = yaml.safe_load(f)
 
           packages = []
           seen = set()
@@ -86,191 +92,77 @@ stages:
 
           print(f"Parsed {len(packages)} unique versioned packages from environment.yml")
 
-          # --- 2. Query the Xray Component Summary API in batches -----------
-          # Response shape:
-          #   {"artifacts": [{"general": {"component_id": "name:version"},
-          #                    "issues": [...], "licenses": [...], "operational_risks": [...]}]}
-          #
-          # Uses pypi:// component ids: Xray's vulnerability database is
-          # indexed by publishing ecosystem, and most of environment.yml's
-          # packages are conda-packaged mirrors of PyPI projects. conda:// and
-          # generic:// never return real data (no binary for Xray to
-          # fingerprint), so genuinely conda/OS-only packages (vc, openssl,
-          # sqlite, ...) just won't match under any scheme here.
-          components_data = []
-          for i in range(0, len(packages), BATCH_SIZE):
-              batch = packages[i:i + BATCH_SIZE]
-              payload = {
-                  'component_details': [
-                      {'component_id': f"pypi://{p['name']}:{p['version']}"}
-                      for p in batch
-                  ]
-              }
-              print(f"Querying Xray for packages {i + 1}-{i + len(batch)} of {len(packages)}...")
+          # (name, version) -> (subdir, filename), built from each subdir's
+          # repodata.json without conda's own solver/index machinery.
+          lookup = {}
+          for subdir in SUBDIRS:
+              print(f"Fetching repodata.json for {subdir}...")
               try:
-                  result = api_call('/xray/api/v1/summary/component', method='POST', payload=payload)
-              except urllib.error.HTTPError as e:
-                  print(f"  HTTP {e.code}: {e.read().decode(errors='replace')[:300]}")
+                  body = get(f"/artifactory/{CONDA_REPO}/{subdir}/repodata.json")
+              except (urllib.error.HTTPError, urllib.error.URLError) as e:
+                  print(f"  could not fetch {subdir}/repodata.json: {e}")
                   continue
-              artifacts = result.get('artifacts', []) if isinstance(result, dict) else []
-              components_data.extend(artifacts)
+              print(f"  {len(body) / 1_000_000:.1f} MB")
+              data = json.loads(body)
+              entries = {}
+              entries.update(data.get('packages', {}))
+              entries.update(data.get('packages.conda', {}))
+              for filename, info in entries.items():
+                  key = (info.get('name'), info.get('version'))
+                  lookup.setdefault(key, (subdir, filename))
+              print(f"  {len(entries)} entries indexed")
 
-          print(f"Xray returned data for {len(components_data)} component lookups")
-
-          # --- 3. Fetch ignore rules for gsrsd_watch ------------------------
-          # Per-rule field names (watches/watch_names, vulnerabilities/cves)
-          # are best-effort guesses, not yet checked against a real rule.
-          # raw_ignore_rules in xray-results.json has the actual shape once
-          # one exists — fix the field names here if it doesn't match.
-          try:
-              ignore_rules_raw = api_call('/xray/api/v1/ignore_rules')
-          except urllib.error.HTTPError as e:
-              print(f"Could not fetch ignore rules (HTTP {e.code}): {e.read().decode(errors='replace')[:300]}")
-              ignore_rules_raw = {}
-
-          if isinstance(ignore_rules_raw, dict):
-              ignore_rules = ignore_rules_raw.get('data', [])
-          else:
-              ignore_rules = ignore_rules_raw or []
-          if not isinstance(ignore_rules, list):
-              ignore_rules = []
-
-          def rule_applies_to_watch(rule):
-              watches = rule.get('watches') or rule.get('watch_names') or []
-              return not watches or WATCH_NAME in watches
-
-          def rule_cves(rule):
-              vulns = rule.get('vulnerabilities') or rule.get('cves') or []
-              out = set()
-              for v in vulns:
-                  out.add(v if isinstance(v, str) else (v.get('cve') or v.get('id')))
-              return {v for v in out if v}
-
-          ignored_cves = set()
-          for rule in ignore_rules:
-              if rule.get('is_expired'):
+          os.makedirs('conda-pkgs', exist_ok=True)
+          found = 0
+          missing = []
+          for p in packages:
+              match = lookup.get((p['name'], p['version']))
+              if not match:
+                  missing.append(f"{p['name']}={p['version']}")
                   continue
-              if not rule_applies_to_watch(rule):
+              subdir, filename = match
+              try:
+                  body = get(f"/artifactory/{CONDA_REPO}/{subdir}/{filename}")
+              except (urllib.error.HTTPError, urllib.error.URLError) as e:
+                  print(f"  could not download {filename}: {e}")
+                  missing.append(f"{p['name']}={p['version']}")
                   continue
-              ignored_cves |= rule_cves(rule)
+              with open(os.path.join('conda-pkgs', filename), 'wb') as f:
+                  f.write(body)
+              found += 1
 
-          print(f"Loaded {len(ignored_cves)} actively-ignored CVE(s) for watch '{WATCH_NAME}'")
-
-          # --- 4. Filter exceptions, apply severity threshold ---------------
-          # issue_cve() handles a nested 'cves' list as a fallback in case
-          # some issue types use it instead of a flat 'cve' field. Issues
-          # with no CVE at all (Xray-native advisories) fall back to issue_id.
-          def issue_cve(issue):
-              cves = issue.get('cves') or []
-              for c in cves:
-                  cve = c.get('cve') if isinstance(c, dict) else c
-                  if cve:
-                      return cve
-              return issue.get('cve')
-
-          violations = []
-          seen_violations = set()
-          for component in components_data:
-              component_id = component.get('general', {}).get('component_id')
-              for issue in component.get('issues', []):
-                  cve = issue_cve(issue)
-                  severity = issue.get('severity', 'Unknown')
-                  identifier = cve or issue.get('issue_id') or issue.get('summary')
-                  if cve and cve in ignored_cves:
-                      continue
-                  if severity not in BLOCKING_SEVERITIES:
-                      continue
-                  key = (component_id, identifier)
-                  if key in seen_violations:
-                      continue
-                  seen_violations.add(key)
-                  violations.append({
-                      'component': component_id,
-                      'cve': cve,
-                      'issue_id': issue.get('issue_id'),
-                      'severity': severity,
-                      'summary': issue.get('summary'),
-                  })
-
-          with open('xray-results.json', 'w') as f:
-              json.dump({
-                  'packages_checked': len(packages),
-                  'components_returned': len(components_data),
-                  'ignored_cve_count': len(ignored_cves),
-                  'violations': violations,
-                  'raw_components': components_data,
-                  'raw_ignore_rules': ignore_rules,
-              }, f, indent=2)
-
-          # --- 5. SARIF for the Azure DevOps Code Analysis Logs tab ---------
-          SEVERITY_TO_SARIF_LEVEL = {'Critical': 'error', 'High': 'error', 'Medium': 'warning', 'Low': 'note'}
-          rule_ids_seen = set()
-          rules = []
-          results = []
-          for v in violations:
-              rule_id = v['cve'] or v['issue_id'] or 'XRAY-UNKNOWN'
-              if rule_id not in rule_ids_seen:
-                  rule_ids_seen.add(rule_id)
-                  rules.append({
-                      'id': rule_id,
-                      'name': rule_id,
-                      'shortDescription': {'text': (v['summary'] or rule_id)[:200]},
-                      'helpUri': f"https://nvd.nist.gov/vuln/detail/{v['cve']}" if v['cve'] else '',
-                  })
-              package_name = (v['component'] or '').split(':')[0]
-              line = line_for_name.get(package_name, 1)
-              results.append({
-                  'ruleId': rule_id,
-                  'level': SEVERITY_TO_SARIF_LEVEL.get(v['severity'], 'warning'),
-                  'message': {'text': f"{v['component']}: {v['summary'] or rule_id} [{v['severity']}]"},
-                  'locations': [{
-                      'physicalLocation': {
-                          'artifactLocation': {'uri': 'environment.yml'},
-                          'region': {'startLine': line},
-                      },
-                  }],
-              })
-
-          sarif = {
-              '$schema': 'https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json',
-              'version': '2.1.0',
-              'runs': [{
-                  'tool': {'driver': {
-                      'name': 'JFrog Xray Component Search',
-                      'informationUri': 'https://jfrog.com/xray/',
-                      'version': '1.0.0',
-                      'rules': rules,
-                  }},
-                  'results': results,
-              }],
-          }
-          with open('xray.sarif', 'w') as f:
-              json.dump(sarif, f, indent=2)
-
-          print(f"\n{'='*60}")
-          print(f" XRAY REPORT (watch: {WATCH_NAME}, blocking severities: {sorted(BLOCKING_SEVERITIES)})")
-          print(f"{'='*60}")
-          print(f"  Packages checked : {len(packages)}")
-          print(f"  Ignored CVEs     : {len(ignored_cves)}")
-          print(f"  Violations       : {len(violations)}")
-          if violations:
-              print()
-              for v in violations:
-                  print(f"  x {v['component']}  {v['cve'] or v['issue_id'] or '(no id)'}  [{v['severity']}]")
-                  if v['summary']:
-                      print(f"    {v['summary'][:200]}")
-          print(f"{'='*60}\n")
-
-          if violations:
-              sys.exit(1)
+          print(f"Downloaded {found}/{len(packages)} packages to conda-pkgs/")
+          if missing:
+              shown = ', '.join(missing[:30])
+              more = ' ...' if len(missing) > 30 else ''
+              print(f"Not found in any subdir ({len(missing)}): {shown}{more}")
           PYEOF
 
-    - task: PublishPipelineArtifact@1
-      displayName: Publish Xray Results
-      condition: always()
+    - task: CmdLine@2
+      displayName: Scan downloaded packages with Xray
       inputs:
-        targetPath: xray-results.json
-        artifactName: XrayResults
+        script: |
+          # --watches applies the gsrsd_watch policy (and its ignore rules/
+          # exceptions) natively, so this only fails the build on violations
+          # that aren't already excepted.
+          set +e
+          jf scan conda-pkgs/ \
+            --server-id=jfrog-bot \
+            --watches=gsrsd_watch \
+            --format=sarif > xray.sarif
+          sarif_rc=$?
+
+          jf scan conda-pkgs/ \
+            --server-id=jfrog-bot \
+            --watches=gsrsd_watch \
+            --format=json > xray.json
+          json_rc=$?
+          set -e
+
+          if [ "$sarif_rc" -ne 0 ] || [ "$json_rc" -ne 0 ]; then
+            echo "Xray reported violations against watch 'gsrsd_watch' not covered by an existing exception."
+            exit 1
+          fi
 
     - task: PublishPipelineArtifact@1
       displayName: Publish SARIF Results
@@ -279,89 +171,12 @@ stages:
         targetPath: xray.sarif
         artifactName: CodeAnalysisLogs
 
-    - task: CmdLine@2
-      env:
-        JFROG_URL: $(jfrog_url)
-        JFROG_ACCESS_TOKEN: $(jfrog_bot_token)
-        BUILD_NAME: $(Build.Repository.Name)
-        BUILD_NUMBER: $(Build.BuildId)
-      displayName: Publish build-info and trigger Xray build scan
-      condition: succeededOrFailed()
+    - task: PublishPipelineArtifact@1
+      displayName: Publish JSON Results
+      condition: always()
       inputs:
-        script: |
-          python3 - <<'PYEOF'
-          # Gives these results a real, browsable home in JFrog: publishing a
-          # build (metadata only, no binaries) lets Xray treat it as a watched
-          # resource with its own scan history and violations view under
-          # gsrsd_watch, unlike the raw component-search calls above.
-          #
-          # New build names must be opted into Xray indexing once, manually,
-          # before scanBuild does anything (JFrog UI: select the build under
-          # Artifactory > Builds > Add/Remove to Xray > Build). Until that's
-          # done, scanBuild succeeds but reports the build as not indexed.
-          import yaml, json, os, sys, datetime, urllib.request, urllib.error
-
-          JFROG_URL = os.environ['JFROG_URL'].rstrip('/')
-          TOKEN = os.environ['JFROG_ACCESS_TOKEN']
-          BUILD_NAME = os.environ['BUILD_NAME']
-          BUILD_NUMBER = os.environ['BUILD_NUMBER']
-
-          def api_call(path, method='GET', payload=None):
-              data = json.dumps(payload).encode() if payload is not None else None
-              req = urllib.request.Request(
-                  f"{JFROG_URL}{path}",
-                  data=data,
-                  headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {TOKEN}'},
-                  method=method,
-              )
-              with urllib.request.urlopen(req) as resp:
-                  body = resp.read()
-                  return resp.status, (json.loads(body) if body else {})
-
-          with open('environment.yml') as f:
-              env = yaml.safe_load(f)
-
-          deps = []
-          seen = set()
-          for dep in env.get('dependencies', []):
-              if not isinstance(dep, str):
-                  continue
-              parts = dep.split('=')
-              name = parts[0]
-              version = parts[1] if len(parts) >= 2 and parts[1] else None
-              if not version or name in seen:
-                  continue
-              seen.add(name)
-              deps.append({'id': f"{name}:{version}", 'type': 'pypi'})
-
-          build_info = {
-              'version': '1.0.1',
-              'name': BUILD_NAME,
-              'number': BUILD_NUMBER,
-              'started': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000+0000'),
-              'modules': [{
-                  'id': 'environment.yml',
-                  'type': 'pip',
-                  'dependencies': deps,
-              }],
-          }
-
-          print(f"Publishing build-info for {BUILD_NAME}/{BUILD_NUMBER} ({len(deps)} dependencies)...")
-          try:
-              status, resp = api_call('/artifactory/api/build', method='PUT', payload=build_info)
-              print(f"  build-publish -> HTTP {status}: {json.dumps(resp)[:500]}")
-          except urllib.error.HTTPError as e:
-              print(f"  build-publish -> HTTP {e.code}: {e.read().decode(errors='replace')[:1000]}")
-              sys.exit(0)  # visibility-only step; never fail the job over this
-
-          print(f"Triggering Xray build scan for {BUILD_NAME}/{BUILD_NUMBER}...")
-          try:
-              status, resp = api_call('/xray/api/v1/scanBuild', method='POST',
-                                       payload={'buildName': BUILD_NAME, 'buildNumber': BUILD_NUMBER})
-              print(f"  scanBuild -> HTTP {status}: {json.dumps(resp)[:1000]}")
-          except urllib.error.HTTPError as e:
-              print(f"  scanBuild -> HTTP {e.code}: {e.read().decode(errors='replace')[:1000]}")
-          PYEOF
+        targetPath: xray.json
+        artifactName: XrayJsonResults
 
 - stage: Github
   displayName: 'Publish to GitHub'
