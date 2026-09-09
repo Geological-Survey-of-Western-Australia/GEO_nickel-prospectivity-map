@@ -57,6 +57,30 @@ stages:
                   body = resp.read()
                   return json.loads(body) if body else {}
 
+          def ping(label, path):
+              try:
+                  req = urllib.request.Request(
+                      f"{JFROG_URL}{path}",
+                      headers={'Authorization': f'Bearer {TOKEN}'},
+                  )
+                  with urllib.request.urlopen(req) as resp:
+                      print(f"  {label}: HTTP {resp.status} — {resp.read()[:200]}")
+              except urllib.error.HTTPError as e:
+                  print(f"  {label}: HTTP {e.code} — {e.read()[:200]}")
+              except Exception as e:
+                  print(f"  {label}: {type(e).__name__}: {e}")
+
+          # --- 0. Sanity-check connectivity before trusting component/id ---
+          # The component/id call below 404'd with a generic router-level
+          # "page not found" rather than a JSON error — that's Xray's own
+          # microservice never being reached, not an auth/data problem. These
+          # two pings isolate whether it's Xray specifically (not provisioned,
+          # or a moved endpoint) vs. JFROG_URL/auth being wrong in general.
+          print("Connectivity checks:")
+          ping("Artifactory ping", "/artifactory/api/system/ping")
+          ping("Xray ping", "/xray/api/v1/system/ping")
+          print()
+
           # --- 1. Parse environment.yml ------------------------------------
           with open('environment.yml') as f:
               env = yaml.safe_load(f)
