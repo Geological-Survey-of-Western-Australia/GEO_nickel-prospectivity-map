@@ -102,56 +102,61 @@ stages:
           print(f"Parsed {len(packages)} unique versioned packages from environment.yml")
 
           # --- 2. Query the Xray Component Summary API in batches -----------
-          # /xray/api/v1/component/id (used by the old pipeline's Windows-only
-          # branch) 404s on this instance -- it was apparently never actually
-          # validated. Using /xray/api/v1/summary/component instead, which
-          # returns results under a 'component_details' key rather than 'data'.
-          # 'conda://name:version' as the component-id scheme is still
-          # unverified — if every component below comes back with zero
-          # vulnerabilities, check raw_components in xray-results.json for the
-          # actual response shape before trusting a clean result.
-          # Probe a few candidate component-id schemes against one well-known,
-          # definitely-vulnerable-somewhere package before committing to one —
-          # cheaper than another full round-trip if the guess is wrong again.
-          probe_pkg = next((p for p in packages if p['name'] in ('numpy', 'pillow', 'cryptography')), packages[0])
-          print(f"Component-ID format probe (using {probe_pkg['name']}={probe_pkg['version']}):")
-          for label, cid in [
-              ('conda://name:version', f"conda://{probe_pkg['name']}:{probe_pkg['version']}"),
-              ('purl pkg:conda', f"pkg:conda/{probe_pkg['name']}@{probe_pkg['version']}"),
-              ('generic://name:version', f"generic://{probe_pkg['name']}:{probe_pkg['version']}"),
-          ]:
+          # Confirmed response shape (this instance):
+          #   {"artifacts": [{"general": {"component_id": "name:version"},
+          #                    "issues": [...], "licenses": [...], "operational_risks": [...]}]}
+          # 'general.component_id' comes back scheme-stripped ("name:version")
+          # regardless of what scheme prefix was sent.
+          #
+          # conda:// and generic:// both came back with issues: [] and a bogus
+          # "Unknown" license for cryptography==48.0.0 — a real package with a
+          # real license and CVE history. That's Xray not having a vulnerability
+          # database indexed under those namespaces at all: CVEs/advisories are
+          # catalogued against the actual publishing ecosystem (pypi, npm, ...),
+          # not conda. Since most of environment.yml's packages are conda-
+          # packaged mirrors of PyPI projects, run a second pass with pypi://
+          # so those get a real shot at matching. conda:// is kept as the first
+          # pass for anything genuinely conda/OS-only that pypi won't resolve.
+          def query_schema(scheme):
+              found = []
+              for i in range(0, len(packages), BATCH_SIZE):
+                  batch = packages[i:i + BATCH_SIZE]
+                  payload = {
+                      'component_details': [
+                          {'component_id': f"{scheme}://{p['name']}:{p['version']}"}
+                          for p in batch
+                      ]
+                  }
+                  print(f"  [{scheme}] querying packages {i + 1}-{i + len(batch)} of {len(packages)}...")
+                  try:
+                      result = api_call('/xray/api/v1/summary/component', method='POST', payload=payload)
+                  except urllib.error.HTTPError as e:
+                      print(f"    HTTP {e.code}: {e.read().decode(errors='replace')[:300]}")
+                      continue
+                  artifacts = result.get('artifacts', []) if isinstance(result, dict) else []
+                  if i == 0:
+                      print(f"    Raw response (first batch, truncated): {json.dumps(result)[:1000]}")
+                  found.extend(artifacts)
+              return found
+
+          print("Component-ID format probe (Jinja2 3.0.3 is affected by CVE-2024-22195 — a good canary):")
+          probe_pkg = next((p for p in packages if p['name'] == 'jinja2'), packages[0])
+          for scheme in ('conda', 'pypi', 'generic'):
+              cid = f"{scheme}://{probe_pkg['name']}:{probe_pkg['version']}"
               try:
                   r = api_call('/xray/api/v1/summary/component', method='POST',
                                payload={'component_details': [{'component_id': cid}]})
-                  print(f"  [{label}] {cid} -> {json.dumps(r)[:600]}")
+                  print(f"  [{scheme}] {cid} -> {json.dumps(r)[:600]}")
               except urllib.error.HTTPError as e:
-                  print(f"  [{label}] {cid} -> HTTP {e.code}: {e.read().decode(errors='replace')[:300]}")
+                  print(f"  [{scheme}] {cid} -> HTTP {e.code}: {e.read().decode(errors='replace')[:300]}")
           print()
 
-          components_data = []
-          for i in range(0, len(packages), BATCH_SIZE):
-              batch = packages[i:i + BATCH_SIZE]
-              payload = {
-                  'component_details': [
-                      {'component_id': f"conda://{p['name']}:{p['version']}"}
-                      for p in batch
-                  ]
-              }
-              print(f"Querying Xray for packages {i + 1}-{i + len(batch)} of {len(packages)}...")
-              try:
-                  result = api_call('/xray/api/v1/summary/component', method='POST', payload=payload)
-              except urllib.error.HTTPError as e:
-                  print(f"  HTTP {e.code} querying summary/component: {e.read().decode(errors='replace')[:500]}")
-                  raise
-              if i == 0:
-                  print(f"  Raw response (first batch, truncated): {json.dumps(result)[:1000]}")
-              if isinstance(result, list):
-                  batch_data = result
-              else:
-                  batch_data = result.get('component_details') or result.get('data') or []
-              components_data.extend(batch_data)
+          print("Querying Xray (conda:// pass):")
+          components_data = query_schema('conda')
+          print("Querying Xray (pypi:// pass):")
+          components_data += query_schema('pypi')
 
-          print(f"Xray returned data for {len(components_data)} component(s)")
+          print(f"Xray returned data for {len(components_data)} component lookups")
 
           # --- 3. Fetch ignore rules for gsrsd_watch ------------------------
           # NOTE: endpoint/schema unverified against this Xray instance —
@@ -194,20 +199,41 @@ stages:
           print(f"Loaded {len(ignored_cves)} actively-ignored CVE(s) for watch '{WATCH_NAME}'")
 
           # --- 4. Filter exceptions, apply severity threshold ---------------
+          # 'issues' entries' exact field names are still unconfirmed (every
+          # probe so far returned issues: [] to test against) — extraction
+          # below tries the plausible variants defensively. raw_components in
+          # xray-results.json has the real shape once something actually hits.
+          def issue_cve(issue):
+              cves = issue.get('cves') or []
+              for c in cves:
+                  cve = c.get('cve') if isinstance(c, dict) else c
+                  if cve:
+                      return cve
+              return issue.get('cve')
+
           violations = []
+          seen_violations = set()
           for component in components_data:
-              for vuln in component.get('vulnerabilities', []):
-                  cve = vuln.get('cve')
-                  severity = vuln.get('severity', 'Unknown')
+              component_id = component.get('general', {}).get('component_id')
+              for issue in component.get('issues', []):
+                  cve = issue_cve(issue)
+                  severity = issue.get('severity', 'Unknown')
+                  identifier = cve or issue.get('issue_id') or issue.get('summary')
                   if cve and cve in ignored_cves:
                       continue
-                  if severity in BLOCKING_SEVERITIES:
-                      violations.append({
-                          'component': component.get('component_id'),
-                          'cve': cve,
-                          'severity': severity,
-                          'summary': vuln.get('summary'),
-                      })
+                  if severity not in BLOCKING_SEVERITIES:
+                      continue
+                  key = (component_id, identifier)
+                  if key in seen_violations:
+                      continue
+                  seen_violations.add(key)
+                  violations.append({
+                      'component': component_id,
+                      'cve': cve,
+                      'issue_id': issue.get('issue_id'),
+                      'severity': severity,
+                      'summary': issue.get('summary'),
+                  })
 
           with open('xray-results.json', 'w') as f:
               json.dump({
@@ -228,7 +254,7 @@ stages:
           if violations:
               print()
               for v in violations:
-                  print(f"  x {v['component']}  {v['cve']}  [{v['severity']}]")
+                  print(f"  x {v['component']}  {v['cve'] or v['issue_id'] or '(no id)'}  [{v['severity']}]")
                   if v['summary']:
                       print(f"    {v['summary'][:200]}")
           print(f"{'='*60}\n")
