@@ -4,7 +4,7 @@ trigger:
     include:
     - '*'
 variables:
-- group: gswa-jfrog           # requires: jfrog_url, jfrog_bot_token, artifactory_conda_repo
+- group: gswa-jfrog           # requires: jfrog_url, jfrog_bot_token, jfrog_bot_username, artifactory_conda_repo
 - group: nickel-prospectivity-maps  # requires: github_author_token, github_org, github_repo_name
 - name: isMain
   value: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
@@ -39,6 +39,7 @@ stages:
       env:
         JFROG_URL: $(jfrog_url)
         JFROG_ACCESS_TOKEN: $(jfrog_bot_token)
+        JFROG_BOT_USERNAME: $(jfrog_bot_username)
         JFROG_CONDA_REPO: $(artifactory_conda_repo)
       displayName: Install Miniconda and configure JFrog conda channel
       inputs:
@@ -50,13 +51,13 @@ stages:
           conda install -n base conda-libmamba-solver -q -y
           conda config --set solver libmamba
 
-          # .netrc/Basic-Auth only accepts JFrog's short-form "reference tokens" —
-          # a standard (JWT) access token, which is what --access-token issues,
-          # gets rejected with 401. Embed it in the channel URL instead, which is
-          # JFrog's documented method for conda. Azure DevOps masks the literal
-          # value of jfrog_bot_token in logs since it comes from a variable-group secret.
+          # Basic-Auth only accepts a reference token when paired with the exact
+          # username it was issued under (jfrog_bot_username), not an arbitrary
+          # label. Embed it in the channel URL, which is JFrog's documented method
+          # for conda. Azure DevOps masks the literal value of jfrog_bot_token in
+          # logs since it comes from a variable-group secret.
           JFROG_HOST=$(echo "$JFROG_URL" | sed 's|https\?://||' | sed 's|/.*||')
-          JFROG_CHANNEL_URL="https://jfrog-bot:${JFROG_ACCESS_TOKEN}@${JFROG_HOST}/artifactory/$JFROG_CONDA_REPO"
+          JFROG_CHANNEL_URL="https://${JFROG_BOT_USERNAME}:${JFROG_ACCESS_TOKEN}@${JFROG_HOST}/artifactory/$JFROG_CONDA_REPO"
 
           # Replace upstream channels with the JFrog conda virtual repo, explicitly
           # dropping the implicit 'defaults' fallback so packages only ever resolve
