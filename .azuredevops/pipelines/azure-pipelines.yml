@@ -110,6 +110,24 @@ stages:
           # unverified — if every component below comes back with zero
           # vulnerabilities, check raw_components in xray-results.json for the
           # actual response shape before trusting a clean result.
+          # Probe a few candidate component-id schemes against one well-known,
+          # definitely-vulnerable-somewhere package before committing to one —
+          # cheaper than another full round-trip if the guess is wrong again.
+          probe_pkg = next((p for p in packages if p['name'] in ('numpy', 'pillow', 'cryptography')), packages[0])
+          print(f"Component-ID format probe (using {probe_pkg['name']}={probe_pkg['version']}):")
+          for label, cid in [
+              ('conda://name:version', f"conda://{probe_pkg['name']}:{probe_pkg['version']}"),
+              ('purl pkg:conda', f"pkg:conda/{probe_pkg['name']}@{probe_pkg['version']}"),
+              ('generic://name:version', f"generic://{probe_pkg['name']}:{probe_pkg['version']}"),
+          ]:
+              try:
+                  r = api_call('/xray/api/v1/summary/component', method='POST',
+                               payload={'component_details': [{'component_id': cid}]})
+                  print(f"  [{label}] {cid} -> {json.dumps(r)[:600]}")
+              except urllib.error.HTTPError as e:
+                  print(f"  [{label}] {cid} -> HTTP {e.code}: {e.read().decode(errors='replace')[:300]}")
+          print()
+
           components_data = []
           for i in range(0, len(packages), BATCH_SIZE):
               batch = packages[i:i + BATCH_SIZE]
@@ -125,6 +143,8 @@ stages:
               except urllib.error.HTTPError as e:
                   print(f"  HTTP {e.code} querying summary/component: {e.read().decode(errors='replace')[:500]}")
                   raise
+              if i == 0:
+                  print(f"  Raw response (first batch, truncated): {json.dumps(result)[:1000]}")
               if isinstance(result, list):
                   batch_data = result
               else:
@@ -140,8 +160,9 @@ stages:
           # turn out to be wrong.
           try:
               ignore_rules_raw = api_call('/xray/api/v1/ignore_rules')
+              print(f"Raw ignore_rules response (truncated): {json.dumps(ignore_rules_raw)[:1000]}")
           except urllib.error.HTTPError as e:
-              print(f"Could not fetch ignore rules (HTTP {e.code}); treating as none configured")
+              print(f"Could not fetch ignore rules (HTTP {e.code}): {e.read().decode(errors='replace')[:300]}")
               ignore_rules_raw = {}
 
           if isinstance(ignore_rules_raw, dict):
