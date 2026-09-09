@@ -101,12 +101,15 @@ stages:
 
           print(f"Parsed {len(packages)} unique versioned packages from environment.yml")
 
-          # --- 2. Query the Xray Component Search API in batches -----------
-          # NOTE: 'conda://name:version' is the component-id scheme used for
-          # the (removed) Windows-only branch of the old pipeline; unverified
-          # against this Xray instance. If every component below comes back
-          # with zero vulnerabilities, check raw_components in xray-results.json
-          # for the response shape before trusting a clean result.
+          # --- 2. Query the Xray Component Summary API in batches -----------
+          # /xray/api/v1/component/id (used by the old pipeline's Windows-only
+          # branch) 404s on this instance -- it was apparently never actually
+          # validated. Using /xray/api/v1/summary/component instead, which
+          # returns results under a 'component_details' key rather than 'data'.
+          # 'conda://name:version' as the component-id scheme is still
+          # unverified — if every component below comes back with zero
+          # vulnerabilities, check raw_components in xray-results.json for the
+          # actual response shape before trusting a clean result.
           components_data = []
           for i in range(0, len(packages), BATCH_SIZE):
               batch = packages[i:i + BATCH_SIZE]
@@ -118,11 +121,14 @@ stages:
               }
               print(f"Querying Xray for packages {i + 1}-{i + len(batch)} of {len(packages)}...")
               try:
-                  result = api_call('/xray/api/v1/component/id', method='POST', payload=payload)
+                  result = api_call('/xray/api/v1/summary/component', method='POST', payload=payload)
               except urllib.error.HTTPError as e:
-                  print(f"  HTTP {e.code} querying component/id: {e.read().decode(errors='replace')[:500]}")
+                  print(f"  HTTP {e.code} querying summary/component: {e.read().decode(errors='replace')[:500]}")
                   raise
-              batch_data = result if isinstance(result, list) else result.get('data', [])
+              if isinstance(result, list):
+                  batch_data = result
+              else:
+                  batch_data = result.get('component_details') or result.get('data') or []
               components_data.extend(batch_data)
 
           print(f"Xray returned data for {len(components_data)} component(s)")
