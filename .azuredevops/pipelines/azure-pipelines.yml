@@ -57,30 +57,6 @@ stages:
                   body = resp.read()
                   return json.loads(body) if body else {}
 
-          def ping(label, path):
-              try:
-                  req = urllib.request.Request(
-                      f"{JFROG_URL}{path}",
-                      headers={'Authorization': f'Bearer {TOKEN}'},
-                  )
-                  with urllib.request.urlopen(req) as resp:
-                      print(f"  {label}: HTTP {resp.status} — {resp.read()[:200]}")
-              except urllib.error.HTTPError as e:
-                  print(f"  {label}: HTTP {e.code} — {e.read()[:200]}")
-              except Exception as e:
-                  print(f"  {label}: {type(e).__name__}: {e}")
-
-          # --- 0. Sanity-check connectivity before trusting component/id ---
-          # The component/id call below 404'd with a generic router-level
-          # "page not found" rather than a JSON error — that's Xray's own
-          # microservice never being reached, not an auth/data problem. These
-          # two pings isolate whether it's Xray specifically (not provisioned,
-          # or a moved endpoint) vs. JFROG_URL/auth being wrong in general.
-          print("Connectivity checks:")
-          ping("Artifactory ping", "/artifactory/api/system/ping")
-          ping("Xray ping", "/xray/api/v1/system/ping")
-          print()
-
           # --- 1. Parse environment.yml ------------------------------------
           with open('environment.yml') as f:
               env = yaml.safe_load(f)
@@ -102,70 +78,49 @@ stages:
           print(f"Parsed {len(packages)} unique versioned packages from environment.yml")
 
           # --- 2. Query the Xray Component Summary API in batches -----------
-          # Confirmed response shape (this instance):
+          # Response shape:
           #   {"artifacts": [{"general": {"component_id": "name:version"},
           #                    "issues": [...], "licenses": [...], "operational_risks": [...]}]}
-          # 'general.component_id' comes back scheme-stripped ("name:version")
-          # regardless of what scheme prefix was sent.
           #
-          # conda:// and generic:// both came back with issues: [] and a bogus
-          # "Unknown" license for cryptography==48.0.0 — a real package with a
-          # real license and CVE history. That's Xray not having a vulnerability
-          # database indexed under those namespaces at all: CVEs/advisories are
-          # catalogued against the actual publishing ecosystem (pypi, npm, ...),
-          # not conda. Since most of environment.yml's packages are conda-
-          # packaged mirrors of PyPI projects, run a second pass with pypi://
-          # so those get a real shot at matching. conda:// is kept as the first
-          # pass for anything genuinely conda/OS-only that pypi won't resolve.
-          def query_schema(scheme):
-              found = []
-              for i in range(0, len(packages), BATCH_SIZE):
-                  batch = packages[i:i + BATCH_SIZE]
-                  payload = {
-                      'component_details': [
-                          {'component_id': f"{scheme}://{p['name']}:{p['version']}"}
-                          for p in batch
-                      ]
-                  }
-                  print(f"  [{scheme}] querying packages {i + 1}-{i + len(batch)} of {len(packages)}...")
-                  try:
-                      result = api_call('/xray/api/v1/summary/component', method='POST', payload=payload)
-                  except urllib.error.HTTPError as e:
-                      print(f"    HTTP {e.code}: {e.read().decode(errors='replace')[:300]}")
-                      continue
-                  artifacts = result.get('artifacts', []) if isinstance(result, dict) else []
-                  if i == 0:
-                      print(f"    Raw response (first batch, truncated): {json.dumps(result)[:1000]}")
-                  found.extend(artifacts)
-              return found
-
-          print("Component-ID format probe (Jinja2 3.0.3 is affected by CVE-2024-22195 — a good canary):")
-          probe_pkg = next((p for p in packages if p['name'] == 'jinja2'), packages[0])
-          for scheme in ('conda', 'pypi', 'generic'):
-              cid = f"{scheme}://{probe_pkg['name']}:{probe_pkg['version']}"
+          # Only the pypi:// component-id scheme returns real data on this
+          # instance. Xray's vulnerability database is indexed by publishing
+          # ecosystem, not by conda; conda:// and generic:// were confirmed
+          # (across all 254 packages, not just a sample) to always come back
+          # with issues: [] and a bogus "Unknown" license, including for
+          # packages with well-documented real CVEs and licenses. Since most
+          # of environment.yml's packages are conda-packaged mirrors of PyPI
+          # projects, pypi:// is what actually finds anything; genuinely
+          # conda/OS-only packages (vc, openssl, sqlite, ...) just won't match
+          # under any scheme without a real binary for Xray to fingerprint.
+          components_data = []
+          for i in range(0, len(packages), BATCH_SIZE):
+              batch = packages[i:i + BATCH_SIZE]
+              payload = {
+                  'component_details': [
+                      {'component_id': f"pypi://{p['name']}:{p['version']}"}
+                      for p in batch
+                  ]
+              }
+              print(f"Querying Xray for packages {i + 1}-{i + len(batch)} of {len(packages)}...")
               try:
-                  r = api_call('/xray/api/v1/summary/component', method='POST',
-                               payload={'component_details': [{'component_id': cid}]})
-                  print(f"  [{scheme}] {cid} -> {json.dumps(r)[:600]}")
+                  result = api_call('/xray/api/v1/summary/component', method='POST', payload=payload)
               except urllib.error.HTTPError as e:
-                  print(f"  [{scheme}] {cid} -> HTTP {e.code}: {e.read().decode(errors='replace')[:300]}")
-          print()
-
-          print("Querying Xray (conda:// pass):")
-          components_data = query_schema('conda')
-          print("Querying Xray (pypi:// pass):")
-          components_data += query_schema('pypi')
+                  print(f"  HTTP {e.code}: {e.read().decode(errors='replace')[:300]}")
+                  continue
+              artifacts = result.get('artifacts', []) if isinstance(result, dict) else []
+              components_data.extend(artifacts)
 
           print(f"Xray returned data for {len(components_data)} component lookups")
 
           # --- 3. Fetch ignore rules for gsrsd_watch ------------------------
-          # NOTE: endpoint/schema unverified against this Xray instance —
-          # raw_ignore_rules in xray-results.json shows the real shape if the
-          # field names guessed below (watches/watch_names, vulnerabilities/cves)
-          # turn out to be wrong.
+          # The endpoint itself and its top-level 'data' wrapper are confirmed
+          # ({"data": [], "total_count": 0} with none configured yet), but the
+          # per-rule field names below (watches/watch_names, vulnerabilities/
+          # cves) are still guesses — there's been nothing non-empty to check
+          # them against. raw_ignore_rules in xray-results.json preserves the
+          # real shape once a rule actually exists, to confirm or fix them.
           try:
               ignore_rules_raw = api_call('/xray/api/v1/ignore_rules')
-              print(f"Raw ignore_rules response (truncated): {json.dumps(ignore_rules_raw)[:1000]}")
           except urllib.error.HTTPError as e:
               print(f"Could not fetch ignore rules (HTTP {e.code}): {e.read().decode(errors='replace')[:300]}")
               ignore_rules_raw = {}
@@ -199,10 +154,11 @@ stages:
           print(f"Loaded {len(ignored_cves)} actively-ignored CVE(s) for watch '{WATCH_NAME}'")
 
           # --- 4. Filter exceptions, apply severity threshold ---------------
-          # 'issues' entries' exact field names are still unconfirmed (every
-          # probe so far returned issues: [] to test against) — extraction
-          # below tries the plausible variants defensively. raw_components in
-          # xray-results.json has the real shape once something actually hits.
+          # issue/severity/summary field names confirmed correct against real
+          # data (76 genuine CVEs matched on the first successful run, e.g.
+          # Pillow, Jinja2, cryptography, Tornado). issue_cve() also handles a
+          # nested 'cves' list as a fallback in case some issue types use it
+          # instead of a flat 'cve' field.
           def issue_cve(issue):
               cves = issue.get('cves') or []
               for c in cves:
