@@ -50,18 +50,24 @@ stages:
           conda install -n base conda-libmamba-solver -q -y
           conda config --set solver libmamba
 
-          # Authenticate to JFrog via .netrc so credentials are not embedded in channel URLs
+          # .netrc/Basic-Auth only accepts JFrog's short-form "reference tokens" —
+          # a standard (JWT) access token, which is what --access-token issues,
+          # gets rejected with 401. Embed it in the channel URL instead, which is
+          # JFrog's documented method for conda. Azure DevOps masks the literal
+          # value of jfrog_bot_token in logs since it comes from a variable-group secret.
           JFROG_HOST=$(echo "$JFROG_URL" | sed 's|https\?://||' | sed 's|/.*||')
-          echo "machine $JFROG_HOST login jfrog-bot password $JFROG_ACCESS_TOKEN" > ~/.netrc
-          chmod 600 ~/.netrc
+          JFROG_CHANNEL_URL="https://jfrog-bot:${JFROG_ACCESS_TOKEN}@${JFROG_HOST}/artifactory/$JFROG_CONDA_REPO"
 
-          # Replace upstream channels with the JFrog conda virtual repo.
-          # Packages fetched through this channel are cached in Artifactory and
-          # automatically indexed by Xray, which populates results in the JFrog UI.
+          # Replace upstream channels with the JFrog conda virtual repo, explicitly
+          # dropping the implicit 'defaults' fallback so packages only ever resolve
+          # through JFrog. Packages fetched through this channel are cached in
+          # Artifactory and automatically indexed by Xray, which populates results
+          # in the JFrog UI.
           # NOTE: your conda virtual repo must proxy both 'defaults' and 'esri' channels.
-          conda config --remove-key channels 2>/dev/null || true
-          conda config --add channels "$JFROG_URL/artifactory/$JFROG_CONDA_REPO"
+          conda config --remove channels defaults 2>/dev/null || true
+          conda config --add channels "$JFROG_CHANNEL_URL"
           conda config --set channel_priority strict
+          chmod 600 "$HOME/.condarc" 2>/dev/null || true
 
     - task: CmdLine@2
       displayName: Parse environment.yml
