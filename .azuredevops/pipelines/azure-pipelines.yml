@@ -121,6 +121,10 @@ stages:
           # etc.). Clear it so the find below only picks up what we request here.
           rm -rf "$HOME/miniconda/pkgs"/*
 
+          # `conda install --download-only --prefix` requires an already-initialized
+          # conda environment at that prefix, or it fails with EnvironmentLocationNotFound.
+          conda create --prefix /tmp/scan-prefix --yes
+
           download() {
             local pkgfile=$1
             local pkgs
