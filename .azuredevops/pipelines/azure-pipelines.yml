@@ -390,14 +390,16 @@ stages:
         script: |
           # Exploratory: no documented conda-specific invocation exists for
           # `jf curation-audit` (unlike pip/npm/maven/docker, which are
-          # explicitly documented). Running it bare against environment.yml
-          # to see whether it auto-detects conda from the manifest directly,
-          # or whether (like Curation's general model) it actually needs a
-          # real package-manager resolution happening through a curated
-          # repo to have anything to audit. Non-fatal either way -- this
-          # stage doesn't gate anything, we're just observing behavior.
+          # explicitly documented), and its own --help output lists no
+          # conda-specific flag either (only pip/npm/maven/.NET/Gradle/
+          # Hugging Face/Docker options exist). Running it bare against
+          # environment.yml to see whether it auto-detects conda from the
+          # manifest directly, or reports no supported technology found.
+          # --server-id isn't a real flag -- it just uses the default
+          # server from `jf config add`, already jfrog-bot. Non-fatal --
+          # this stage doesn't gate anything, we're just observing behavior.
           set +e
-          jf curation-audit --server-id=jfrog-bot --format=json > curation.json
+          jf curation-audit --format=json > curation.json
           rc=$?
           set -e
           echo "jf curation-audit exit code: $rc"
