@@ -363,6 +363,54 @@ stages:
               print(f"  scanBuild -> HTTP {e.code}: {e.read().decode(errors='replace')[:1000]}")
           PYEOF
 
+- stage: CurationAudit
+  displayName: Curation Audit (exploratory)
+  jobs:
+  - job: RunCurationAudit
+    displayName: Run jf curation-audit
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: CmdLine@2
+      env:
+        JFROG_URL: $(jfrog_url)
+        JFROG_ACCESS_TOKEN: $(jfrog_bot_token)
+      displayName: Install and Configure JFrog CLI
+      inputs:
+        script: |
+          curl -fL https://install-cli.jfrog.io | sh
+          jf config add jfrog-bot \
+            --url="$JFROG_URL" \
+            --access-token="$JFROG_ACCESS_TOKEN" \
+            --interactive=false
+
+    - task: CmdLine@2
+      displayName: Run Curation Audit
+      inputs:
+        script: |
+          # Exploratory: no documented conda-specific invocation exists for
+          # `jf curation-audit` (unlike pip/npm/maven/docker, which are
+          # explicitly documented). Running it bare against environment.yml
+          # to see whether it auto-detects conda from the manifest directly,
+          # or whether (like Curation's general model) it actually needs a
+          # real package-manager resolution happening through a curated
+          # repo to have anything to audit. Non-fatal either way -- this
+          # stage doesn't gate anything, we're just observing behavior.
+          set +e
+          jf curation-audit --server-id=jfrog-bot --format=json > curation.json
+          rc=$?
+          set -e
+          echo "jf curation-audit exit code: $rc"
+          echo "--- curation.json ---"
+          cat curation.json 2>/dev/null || echo "(no output file produced)"
+
+    - task: PublishPipelineArtifact@1
+      displayName: Publish Curation Audit Results
+      condition: always()
+      inputs:
+        targetPath: curation.json
+        artifactName: CurationAuditResults
+
 - stage: Github
   displayName: 'Publish to GitHub'
   dependsOn:
