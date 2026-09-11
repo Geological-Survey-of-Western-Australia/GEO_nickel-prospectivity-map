@@ -29,90 +29,10 @@ stages:
         watchName: gsrsd_watch
         failOnVulnerabilities: false
 
-    - task: CmdLine@2
-      env:
-        JFROG_URL: $(jfrog_url)
-        JFROG_ACCESS_TOKEN: $(jfrog_bot_token)
-        BUILD_NAME: $(Build.Repository.Name)
-        BUILD_NUMBER: $(Build.BuildId)
-      displayName: Publish build-info and trigger Xray build scan
-      condition: succeededOrFailed()
-      inputs:
-        script: |
-          python3 - <<'PYEOF'
-          # Publishes a metadata-only build (no binaries) so this run shows up
-          # as a browsable resource in JFrog, separate from the raw Component
-          # Search results above. One-time setup per build name: JFrog UI ->
-          # Artifactory > Builds > select build > Add/Remove to Xray > Build
-          # (otherwise scanBuild succeeds but reports the build as unindexed).
-          #
-          # Visibility only: with no real binaries/checksums, Xray can't
-          # correlate this build to real vulnerability data (see
-          # docs/xray-pipeline-design-decisions.md) -- the actual findings
-          # come from the Component Search step, not from this build's scan.
-          import yaml, json, os, sys, datetime, urllib.request, urllib.error
-
-          JFROG_URL = os.environ['JFROG_URL'].rstrip('/')
-          TOKEN = os.environ['JFROG_ACCESS_TOKEN']
-          BUILD_NAME = os.environ['BUILD_NAME']
-          BUILD_NUMBER = os.environ['BUILD_NUMBER']
-
-          def api_call(path, method='GET', payload=None):
-              data = json.dumps(payload).encode() if payload is not None else None
-              req = urllib.request.Request(
-                  f"{JFROG_URL}{path}",
-                  data=data,
-                  headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {TOKEN}'},
-                  method=method,
-              )
-              with urllib.request.urlopen(req) as resp:
-                  body = resp.read()
-                  return resp.status, (json.loads(body) if body else {})
-
-          with open('environment.yml') as f:
-              env = yaml.safe_load(f)
-
-          deps = []
-          seen = set()
-          for dep in env.get('dependencies', []):
-              if not isinstance(dep, str):
-                  continue
-              parts = dep.split('=')
-              name = parts[0]
-              version = parts[1] if len(parts) >= 2 and parts[1] else None
-              if not version or name in seen:
-                  continue
-              seen.add(name)
-              deps.append({'id': f"{name}:{version}", 'type': 'pypi'})
-
-          build_info = {
-              'version': '1.0.1',
-              'name': BUILD_NAME,
-              'number': BUILD_NUMBER,
-              'started': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000+0000'),
-              'modules': [{
-                  'id': 'environment.yml',
-                  'type': 'pip',
-                  'dependencies': deps,
-              }],
-          }
-
-          print(f"Publishing build-info for {BUILD_NAME}/{BUILD_NUMBER} ({len(deps)} dependencies)...")
-          try:
-              status, resp = api_call('/artifactory/api/build', method='PUT', payload=build_info)
-              print(f"  build-publish -> HTTP {status}: {json.dumps(resp)[:500]}")
-          except urllib.error.HTTPError as e:
-              print(f"  build-publish -> HTTP {e.code}: {e.read().decode(errors='replace')[:1000]}")
-              sys.exit(0)  # visibility-only step; never fail the job over this
-
-          print(f"Triggering Xray build scan for {BUILD_NAME}/{BUILD_NUMBER}...")
-          try:
-              status, resp = api_call('/xray/api/v1/scanBuild', method='POST',
-                                       payload={'buildName': BUILD_NAME, 'buildNumber': BUILD_NUMBER})
-              print(f"  scanBuild -> HTTP {status}: {json.dumps(resp)[:1000]}")
-          except urllib.error.HTTPError as e:
-              print(f"  scanBuild -> HTTP {e.code}: {e.read().decode(errors='replace')[:1000]}")
-          PYEOF
+    - template: templates/xray-build-info-publish.yml
+      parameters:
+        projectType: conda
+        manifestPath: environment.yml
 
 - stage: Github
   displayName: 'Publish to GitHub'
