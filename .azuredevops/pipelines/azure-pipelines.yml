@@ -411,11 +411,19 @@ stages:
           # switches it to `pip install -r requirements.txt` instead, which
           # is what we actually want audited.
           #
+          # pip resolves the whole file as one atomic operation, so arcpy==3.1
+          # (not a real public PyPI package -- confirmed: "No matching
+          # distribution found") aborts the entire audit before numpy/pandas
+          # (which are real) ever get evaluated. requirements.txt itself stays
+          # the accurate "what's actually imported" record; this filtered copy
+          # is only for what curation-audit can actually resolve.
+          #
           # --server-id isn't a real flag -- it just uses the default
           # server from `jf config add`, already jfrog-bot. Non-fatal --
           # this stage doesn't gate anything, we're just observing behavior.
+          grep -v '^arcpy==' requirements.txt > curation-requirements.txt
           set +e
-          jf curation-audit --requirements-file=requirements.txt --format=json > curation.json
+          jf curation-audit --requirements-file=curation-requirements.txt --format=json > curation.json
           rc=$?
           set -e
           echo "jf curation-audit exit code: $rc"
