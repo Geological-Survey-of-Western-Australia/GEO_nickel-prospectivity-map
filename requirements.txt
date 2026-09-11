@@ -1,0 +1,13 @@
+# Packages actually imported in src/nickel_prospectivity/*.py, pinned to the
+# versions in environment.yml. This is not a substitute for environment.yml —
+# it documents real runtime dependencies, not the full ArcGIS Pro conda export
+# (which also includes Jupyter/IDE tooling, dev tools, and transitive deps
+# never imported directly by this project's code).
+#
+# arcpy is not a public PyPI package -- it ships only with a licensed ArcGIS
+# Pro install (via Esri's own conda channel). `pip install -r requirements.txt`
+# will fail on this line outside that environment; it's listed here for
+# documentation completeness, not as something pip can actually resolve.
+arcpy==3.1
+numpy==1.20.1
+pandas==1.4.4
