@@ -1,31 +1,25 @@
 # Reusable Xray Component Search step template.
 #
-# Queries JFrog Xray's Component Summary API (checksum-free identity lookup,
-# no downloads/installs required) for every package in a conda environment.yml
-# or a pip requirements.txt, filters out anything already covered by an
-# accepted Ignore Rule on the given watch, and always publishes the raw
-# results, a SARIF file, and a plain-text disclaimer/summary.
+# Looks up every package in a conda environment.yml or pip requirements.txt
+# against JFrog Xray's Component Summary API (a checksum-free identity
+# lookup -- no download/install needed), drops anything already covered by
+# an accepted Ignore Rule on the given watch, and always publishes the raw
+# results (XrayResults), a SARIF file (CodeAnalysisLogs), and a plain-text
+# disclaimer/summary (XrayDisclaimer).
 #
-# By default this is a transparency/reporting step, not a gate -- most
-# conda-based projects here are research/analysis environments, not hosted
-# services, and environment.yml is a full dev environment (Jupyter, dev
-# tools, etc.) rather than a curated production dependency set, so blocking
-# on every CVE anywhere in it produces more noise than signal. Set
-# failOnVulnerabilities: true (e.g. for a real pip-based service) to make it
-# gate the build on findings at or above blockingSeverities instead.
+# Default mode is transparency, not enforcement: failOnVulnerabilities:
+# false just reports findings. Set it true to gate the build on findings at
+# or above blockingSeverities instead (e.g. for a real hosted service).
 #
-# KNOWN LIMITATION: only pypi:// component ids return real vulnerability
-# data from Xray's Component Search API on this instance -- conda:// and
-# generic:// were confirmed to always come back empty (no binary for Xray to
-# fingerprint). So for a conda project, packages with no PyPI equivalent
-# (OS libraries, ArcGIS-proprietary packages, etc.) get zero coverage here
-# regardless of this template's settings. See
-# docs/xray-conda-coverage-proposal.md in GEO_nickel_prospectivity_mapping
-# for the real-binary-scan alternative that closes this gap, at the cost of
-# a much slower pipeline (confirmed 17-37 minutes vs. seconds for this).
+# LIMITATION: only pypi:// component ids return real data from this API --
+# conda:// and generic:// always come back empty (no binary for Xray to
+# fingerprint). Conda packages with no PyPI equivalent get zero coverage
+# here regardless of settings. See docs/xray-conda-coverage-proposal.md in
+# GEO_nickel_prospectivity_mapping for the real-binary-scan alternative
+# (closes this gap, costs ~20-40x the runtime).
 #
-# Requires the consuming pipeline to have jfrog_url / jfrog_bot_token
-# available (e.g. via the gswa-jfrog variable group).
+# Requires jfrog_url / jfrog_bot_token in the consuming pipeline (e.g. via
+# the gswa-jfrog variable group).
 
 parameters:
 - name: projectType

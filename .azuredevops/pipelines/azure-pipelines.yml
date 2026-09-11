@@ -40,15 +40,16 @@ stages:
       inputs:
         script: |
           python3 - <<'PYEOF'
-          # Gives these results a real, browsable home in JFrog: publishing a
-          # build (metadata only, no binaries) lets Xray treat it as a watched
-          # resource with its own scan history and violations view under
-          # gsrsd_watch, unlike the raw component-search calls above.
+          # Publishes a metadata-only build (no binaries) so this run shows up
+          # as a browsable resource in JFrog, separate from the raw Component
+          # Search results above. One-time setup per build name: JFrog UI ->
+          # Artifactory > Builds > select build > Add/Remove to Xray > Build
+          # (otherwise scanBuild succeeds but reports the build as unindexed).
           #
-          # New build names must be opted into Xray indexing once, manually,
-          # before scanBuild does anything (JFrog UI: select the build under
-          # Artifactory > Builds > Add/Remove to Xray > Build). Until that's
-          # done, scanBuild succeeds but reports the build as not indexed.
+          # Visibility only: with no real binaries/checksums, Xray can't
+          # correlate this build to real vulnerability data (see
+          # docs/xray-pipeline-design-decisions.md) -- the actual findings
+          # come from the Component Search step, not from this build's scan.
           import yaml, json, os, sys, datetime, urllib.request, urllib.error
 
           JFROG_URL = os.environ['JFROG_URL'].rstrip('/')
