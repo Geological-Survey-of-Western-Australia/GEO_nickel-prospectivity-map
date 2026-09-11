@@ -404,11 +404,18 @@ stages:
           # conda-specific flag either (only pip/npm/maven/.NET/Gradle/
           # Hugging Face/Docker options exist). requirements.txt now gives it
           # a real pip project to detect and audit against gswa-pypi-virtual.
+          #
+          # Without --requirements-file, curation-audit runs `pip install .`
+          # -- installing this repo itself as a package -- which fails since
+          # there's no setup.py/pyproject.toml here. --requirements-file
+          # switches it to `pip install -r requirements.txt` instead, which
+          # is what we actually want audited.
+          #
           # --server-id isn't a real flag -- it just uses the default
           # server from `jf config add`, already jfrog-bot. Non-fatal --
           # this stage doesn't gate anything, we're just observing behavior.
           set +e
-          jf curation-audit --format=json > curation.json
+          jf curation-audit --requirements-file=requirements.txt --format=json > curation.json
           rc=$?
           set -e
           echo "jf curation-audit exit code: $rc"
