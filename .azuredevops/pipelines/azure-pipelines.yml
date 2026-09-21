@@ -34,11 +34,22 @@ stages:
         projectType: conda
         manifestPath: environment.yml
 
+    # Capture the scan outcome so the Github stage can read it via output variables
+    - bash: |
+        echo "##vso[task.setvariable variable=xrayOutcome;isOutput=true]$(Agent.JobStatus)"
+        echo "##vso[task.setvariable variable=xrayScanDate;isOutput=true]$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+      name: CaptureOutcome
+      displayName: 'Capture Xray scan outcome'
+      condition: always()
+
 - stage: Github
   displayName: 'Publish to GitHub'
   dependsOn:
   - Xray
   condition: and( succeeded('Xray'), eq(variables.isMain, true) )
+  variables:
+    xrayOutcome: $[ stageDependencies.Xray.ScanEnvironment.outputs['CaptureOutcome.xrayOutcome'] ]
+    xrayScanDate: $[ stageDependencies.Xray.ScanEnvironment.outputs['CaptureOutcome.xrayScanDate'] ]
   jobs:
   - job: Mirror
     displayName: 'Mirror to GitHub'
@@ -49,10 +60,53 @@ stages:
       inputs:
         repository: self
         fetchDepth: 0
+
+    - task: CmdLine@2
+      displayName: 'Generate SECURITY.md'
+      inputs:
+        script: |
+          cat > SECURITY.md << 'EOF'
+          # Security
+
+          ## Scan Summary
+
+          | Field | Value |
+          |---|---|
+          | Scan Tool | JFrog Xray |
+          | Watch | gsrsd_watch |
+          | Manifest Scanned | environment.yml |
+          | Build Number | $(Build.BuildNumber) |
+          | Branch | $(Build.SourceBranchName) |
+          | Scan Date (UTC) | $(xrayScanDate) |
+          | Outcome | $(xrayOutcome) |
+
+          ## Security Notice
+
+          Security scanning was performed during the development and build process. The results reflect the state of the product at the time the scans were undertaken. Security scans may not identify all vulnerabilities and may be subject to false positives or false negatives. Unless otherwise stated, no additional security scanning, validation or assurance activities have been undertaken following completion of the build process. Users are responsible for conducting their own testing, validation and security assessment before deploying or relying on this product.
+          EOF
+
+    - task: Publish@2
+      displayName: 'Publish SECURITY.md as pipeline artifact'
+      inputs:
+        targetPath: 'SECURITY.md'
+        artifact: 'SecurityScanResults'
+        publishLocation: 'pipeline'
+      condition: always()
+
     - task: CmdLine@2
       displayName: 'Push Mirror to GitHub'
       inputs:
         script: |
           git remote remove github 2>/dev/null || true
           git remote add github https://$(github_author_token)@github.com/$(github_org)/$(github_repo_name).git
+
+          git config user.email "pipeline@azuredevops.local"
+          git config user.name "Azure Pipelines"
+
+          cp SECURITY.md /tmp/SECURITY.md
+          git add -f /tmp/SECURITY.md 2>/dev/null || true
+          cp /tmp/SECURITY.md SECURITY.md
+          git add SECURITY.md
+          git commit -m "docs: update SECURITY.md with latest scan results [skip ci]" || echo "No changes to commit"
+
           git push github HEAD:refs/heads/"$BUILD_SOURCEBRANCHNAME" --follow-tags
