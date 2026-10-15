@@ -51,7 +51,7 @@ stages:
     - bash: |
         set -euo pipefail
         python3 - <<'PYEOF'
-        import json, os
+        import datetime, json, os
 
         env = os.environ
         WATCH = env['WATCH_NAME']
@@ -108,48 +108,62 @@ stages:
             'release, reported vulnerabilities will not result in patches or new versions. If you use this '
             'code, you are responsible for maintaining your own copy, including updating dependencies and '
             'applying any fixes.', '',
-            '## Scan Summary', '',
-            '| Field | Value |', '|---|---|',
-            '| Scan Tool | JFrog Xray (Component Summary API) |',
-            f'| Watch | {WATCH} |',
-            f'| Manifest Scanned | {MANIFEST} |',
-            f"| Build Number | {env['BUILD_NUMBER']} |",
-            f"| Branch | {env['BRANCH_NAME']} |",
-            f"| Scan Date (UTC) | {env['SCAN_DATE']} |",
-            f"| Scan Status | {env['SCAN_STATUS']} |",
+        ]
+
+        def plural(n, word):
+            return f'{n} {word}' + ('' if n == 1 else 's')
+
+        try:
+            scan_date = datetime.datetime.strptime(env['SCAN_DATE'], '%Y-%m-%dT%H:%M:%SZ').strftime('%d %B %Y, %H:%M UTC')
+        except ValueError:
+            scan_date = env['SCAN_DATE']
+
+        out += ['## Scan Summary', '']
+        if results is None:
+            out += ['**Results not available.** The scan did not produce results for this build, so no '
+                    'findings can be reported. This does not indicate the absence of vulnerabilities.', '']
+        else:
+            checked = results.get('packages_checked', 0)
+            exceptions = results.get('ignored_cve_count', 0)
+            headline = f"**{plural(len(findings), 'finding')}**" if findings else '**No findings**'
+            headline += f" across {plural(checked, 'package')} checked"
+            if exceptions:
+                headline += f", after {plural(exceptions, 'accepted exception')}"
+            cols = SEV_ORDER[:4] + sorted((s for s in counts if s not in SEV_ORDER[:4]), key=sev_rank)
+            out += [
+                headline + '.', '',
+                '| ' + ' | '.join(cols) + ' |',
+                '|' + '|'.join(':---:' for _ in cols) + '|',
+                '| ' + ' | '.join(str(counts.get(c, 0)) for c in cols) + ' |', '',
+            ]
+
+        out += [
+            '| Scan detail | |', '|---|---|',
+            f'| Date | {scan_date} |',
+            f"| Build | {env['BUILD_NUMBER']} (`{env['BRANCH_NAME']}`) |",
+            '| Tool | JFrog Xray Component Summary API |',
+            f'| Manifest | `{MANIFEST}` |',
+            f"| Status | {env['SCAN_STATUS']} |",
+            '', '## Findings', '',
         ]
 
         if results is None:
-            out += [
-                '| Findings | Not available |', '',
-                '## Findings', '',
-                'Scan results were not available for this build, so no findings can be reported. '
-                'This does not indicate the absence of vulnerabilities.',
-            ]
+            out.append('No findings can be reported because scan results were not available for this build.')
+        elif findings:
+            out += ['| Severity | Package | Version | Identifier | Summary |',
+                    '|---|---|---|---|---|']
+            for item in sorted(findings, key=lambda x: (sev_rank(x.get('severity')), x.get('component') or '')):
+                name, version = split_component(item.get('component'))
+                cve = item.get('cve')
+                ident = (f'[{cve}](https://nvd.nist.gov/vuln/detail/{cve})' if cve
+                         else cell(item.get('issue_id')))
+                out.append(f"| {cell(item.get('severity') or 'Unknown')} | {cell(name)} | "
+                           f"{cell(version)} | {ident} | {cell(item.get('summary'))} |")
         else:
-            total = len(findings)
-            out += [
-                f"| Packages Checked | {results.get('packages_checked', 0)} |",
-                f"| Accepted Exceptions Applied | {results.get('ignored_cve_count', 0)} CVE(s) |",
-                f"| Findings | {total}{f' ({breakdown})' if total else ''} |",
-                '', '## Findings', '',
-            ]
-            if findings:
-                out += ['| Severity | Package | Version | Identifier | Summary |',
-                        '|---|---|---|---|---|']
-                for item in sorted(findings, key=lambda x: (sev_rank(x.get('severity')), x.get('component') or '')):
-                    name, version = split_component(item.get('component'))
-                    cve = item.get('cve')
-                    ident = (f'[{cve}](https://nvd.nist.gov/vuln/detail/{cve})' if cve
-                             else cell(item.get('issue_id')))
-                    out.append(f"| {cell(item.get('severity') or 'Unknown')} | {cell(name)} | "
-                               f"{cell(version)} | {ident} | {cell(item.get('summary'))} |")
-            else:
-                out.append(
-                    f'No known vulnerabilities were reported for the packages checked, after applying '
-                    f'accepted exceptions on the `{WATCH}` watch. See Scan Coverage below for what was '
-                    f'and was not checked.'
-                )
+            out.append(
+                'No known vulnerabilities were reported for the packages checked, after applying '
+                'accepted exceptions. See Scan Coverage below for what was and was not checked.'
+            )
 
         out += [
             '', '## Scan Coverage', '',
@@ -199,19 +213,29 @@ stages:
     - checkout: self
       fetchDepth: 0
 
-    # Reuse the SECURITY.md attached in the Xray stage, placed at the repo root
+    # Reuse the SECURITY.md attached in the Xray stage
     - task: DownloadPipelineArtifact@2
-      displayName: 'Download SECURITY.md to repo root'
+      displayName: 'Download generated SECURITY.md'
       inputs:
         buildType: current
         artifactName: SecurityScanResults
-        targetPath: $(Build.SourcesDirectory)
+        targetPath: $(Pipeline.Workspace)/SecurityScanResults
 
     - bash: |
         set -euo pipefail
 
         git config user.email "pipeline@azuredevops.local"
         git config user.name "Azure Pipelines"
+
+        # Remove any other SECURITY.md copies (any case, root/.github/docs) so GitHub
+        # shows only the generated policy, then overwrite the root one.
+        git ls-files | grep -iE '^(\.github/|docs/)?security\.md$' | while IFS= read -r f; do
+          if [ "$f" != "SECURITY.md" ]; then
+            echo "##vso[task.logissue type=warning]Removing $f from the GitHub mirror; replaced by the generated SECURITY.md"
+            git rm -q -- "$f"
+          fi
+        done || true
+        cp -f "$(Pipeline.Workspace)/SecurityScanResults/SECURITY.md" SECURITY.md
 
         git add SECURITY.md
         git commit -m "docs: update SECURITY.md with latest scan results [skip ci]" || echo "No changes to commit"
