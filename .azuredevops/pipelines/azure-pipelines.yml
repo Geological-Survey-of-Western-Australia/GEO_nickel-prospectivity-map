@@ -3,21 +3,24 @@ trigger:
   branches:
     include:
     - '*'
-variables:
-  - group: gswa-jfrog
-  - group: nickel-prospectivity-maps
-  # for releases
-  - name: isMain
-    value: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
-  # for integration testing
-  - name: isRC
-    value: $[contains(variables['Build.SourceBranch'], 'releases/')]
-  # for modifying/reviewing pipeline
-  - name: isCICD 
-    value: $[contains(variables['Build.SourceBranch'], 'cicd')]
 
-pool:
-  vmImage: ubuntu-latest
+variables:
+- group: gswa-jfrog                 # requires: jfrog_url, jfrog_bot_token
+- group: nickel-prospectivity-maps  # requires: github_author_token, github_org, github_repo_name
+- name: isMain
+  value: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
+- name: isRC
+  value: $[contains(variables['Build.SourceBranch'], 'releases/')]
+- name: isCICD
+  value: $[contains(variables['Build.SourceBranch'], 'cicd')]
+
+# --- SECURITY.md settings: change these when reusing this pipeline ---
+- name: securityOrgName
+  value: 'Geological Survey of Western Australia'
+- name: securityProjectName
+  value: 'nickel prospectivity mapping'   # leave '' to use the repo name
+- name: manifestPath
+  value: 'environment.yml'
 
 stages:
 - stage: Xray
@@ -27,243 +30,213 @@ stages:
     displayName: Scan environment.yml
     pool:
       vmImage: ubuntu-latest
-
     steps:
+    - template: templates/xray-component-search.yml
+      parameters:
+        projectType: conda
+        manifestPath: ${{ variables.manifestPath }}
+        watchName: gsrsd_watch
+        failOnVulnerabilities: false
 
-    - script: |
-        curl -fL https://install-cli.jfrog.io | sh
-        jf config add jfrog-bot \
-          --url="$JFROG_URL" \
-          --access-token="$JFROG_ACCESS_TOKEN" \
-          --interactive=false
-      env:
-        JFROG_URL: $(jfrog_url)
-        JFROG_ACCESS_TOKEN: $(jfrog_bot_token)
-      displayName: Install and Configure JFrog CLI
+    - template: templates/xray-build-info-publish.yml
+      parameters:
+        projectType: conda
+        manifestPath: ${{ variables.manifestPath }}
 
-    - script: |
-        echo "Contents of environment.yml:"
-        cat environment.yml
-      displayName: Show environment.yml
+    # Build the public SECURITY.md from xray-results.json and attach it to the run
+    - bash: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        import datetime, json, os
 
-    - script: |
-        wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O miniconda.sh
-        bash miniconda.sh -b -p "$HOME/miniconda"
-        echo "$HOME/miniconda/bin" >> $GITHUB_PATH
-        export PATH="$HOME/miniconda/bin:$PATH"
-        conda config --set solver libmamba
-        conda install -n base conda-libmamba-solver -q -y
-      displayName: Install Miniconda
+        env = os.environ
+        ORG = env['ORG_NAME'].strip()
+        REPO_NAME = env['GITHUB_REPO_NAME'].strip()
+        REPO_URL = f"https://github.com/{env['GITHUB_ORG'].strip()}/{REPO_NAME}"
+        PROJECT = env['PROJECT_NAME'].strip()
+        if not PROJECT or PROJECT.startswith('$('):   # unset variable -> fall back to repo name
+            PROJECT = REPO_NAME.replace('-', ' ').replace('_', ' ')
+        MANIFEST = env['MANIFEST_PATH']
+        SEV_ORDER = ['Critical', 'High', 'Medium', 'Low', 'Unknown']
 
-    - script: |
-        export PATH="$HOME/miniconda/bin:$PATH"
-        conda install -n base pyyaml -q -y
+        def cell(text, limit=160):
+            text = ' '.join(str(text or '').split())
+            if len(text) > limit:
+                text = text[:limit - 1].rstrip() + '\u2026'
+            return text.replace('|', '\\|') or '-'
 
-        # Strip build strings and Windows-only packages that have no Linux equivalent
-        # but keep ALL packages that exist cross-platform
-        python3 - <<'EOF'
-        import yaml, re, sys
+        def split_component(component_id):
+            cid = (component_id or '').split('://', 1)[-1]
+            name, _, version = cid.rpartition(':')
+            return (name, version) if name else (cid, '')
 
-        # Only skip packages that are genuinely Windows/ArcGIS-proprietary
-        # with no conda equivalent on any platform
-        WINDOWS_ONLY = {
-          'vc', 'vs2015_runtime', 'win_inet_pton', 'wincertstore',
-          'winkerberos', 'winpty', 'pywin32-ctypes', 'pywin32-security',
-          'pywinpty', 'requests-negotiate-sspi', 'icc_rt', 'x86cpu',
-          'python-certifi-win32', 'python_abi',
-        }
-        ESRI_ONLY = {
-          'arcgis', 'arcgispro', 'arcpy', 'arcpy-base',
-          'pro_notebook_integration', 'despatch',
-        }
-        SKIP = WINDOWS_ONLY | ESRI_ONLY
+        def sev_rank(sev):
+            return SEV_ORDER.index(sev) if sev in SEV_ORDER else len(SEV_ORDER)
 
-        with open('environment.yml') as f:
-            env = yaml.safe_load(f)
+        def plural(n, word):
+            return f'{n} {word}' + ('' if n == 1 else 's')
 
-        lines = []
-        seen = set()
-        for dep in env.get('dependencies', []):
-            if not isinstance(dep, str):
-                continue
-            parts = dep.split('=')
-            name = parts[0].strip()
-            version = parts[1].strip() if len(parts) >= 2 else None
-            name_lower = name.lower()
+        try:
+            with open(env['RESULTS_PATH']) as f:
+                results = json.load(f)
+        except (OSError, ValueError):
+            results = None
 
-            if name_lower in SKIP or name_lower in seen:
-                continue
-            seen.add(name_lower)
+        findings = (results or {}).get('findings') or []
+        counts = {}
+        for item in findings:
+            sev = item.get('severity') or 'Unknown'
+            counts[sev] = counts.get(sev, 0) + 1
 
-            # Keep version, strip build string
-            lines.append(f"{name}={version}" if version else name)
+        scan_date = datetime.datetime.now(datetime.timezone.utc).strftime('%d %B %Y, %H:%M UTC')
 
-        with open('environment-scan.yml', 'w') as f:
-            f.write("name: scan-env\n")
-            f.write("channels:\n")
-            for ch in env.get('channels', ['defaults']):
-                f.write(f"  - {ch}\n")
-            f.write("dependencies:\n")
-            for line in lines:
-                f.write(f"  - {line}\n")
+        out = [
+            '# Security Policy', '',
+            f'This security policy applies to the {ORG} {PROJECT} repository on GitHub '
+            f'([{REPO_NAME}]({REPO_URL})), published by the {ORG}. The code is made publicly available to '
+            'support transparency and reproducibility of the associated work. The repository is archived on '
+            'release and is not actively maintained or supported.', '',
+            '## Security Notice', '',
+            'Security scanning was performed during the development and build process. The results reflect '
+            'the state of the product and its dependencies at the time the scans were performed.', '',
+            'Security scans may not identify all vulnerabilities and may be subject to false positives or '
+            'false negatives. Unless otherwise stated, no additional security scanning, validation, monitoring '
+            'or assurance activities have been undertaken following completion of the build process. Users are '
+            'responsible for conducting their own testing, validation and security assessment before deploying, '
+            'implementing or otherwise relying on this product.', '',
+            '## Security/Bugfix Versions', '',
+            'No security or bug fixes are provided for this project. Because the repository is archived on '
+            'release, reported vulnerabilities will not result in patches or new versions. If you use this '
+            'code, you are responsible for maintaining your own copy, including updating dependencies and '
+            'applying any fixes.', '',
+            '## Scan Summary', '',
+        ]
 
-        print(f"Generated environment-scan.yml with {len(lines)} packages")
-        EOF
-
-        echo "--- environment-scan.yml ---"
-        cat environment-scan.yml
-      displayName: Strip build strings, generate scannable environment
-
-    - script: |
-        export PATH="$HOME/miniconda/bin:$PATH"
-        mkdir -p conda-pkgs
-
-        # Download packages without installing
-        # Uses the channels from environment-scan.yml
-        conda install \
-          --download-only \
-          --prefix /tmp/scan-prefix \
-          --file environment-scan.yml \
-          --channel defaults \
-          --channel esri \
-          --override-channels \
-          --yes \
-          2>&1 || true
-
-        # Conda caches downloads in pkgs dir - collect them
-        find "$HOME/miniconda/pkgs" -name "*.conda" -o -name "*.tar.bz2" \
-          | xargs -I{} cp {} conda-pkgs/ 2>/dev/null || true
-
-        echo "Downloaded $(ls conda-pkgs | wc -l) packages"
-        ls conda-pkgs/
-      displayName: Download conda packages for scanning
-
-    - script: |
-        # Scan the directory of actual conda artifacts
-        # Xray understands .conda and .tar.bz2 package formats natively
-        jf scan conda-pkgs/ \
-          --format=json > xray.json
-
-        jf scan conda-pkgs/ \
-          --format=sarif > xray.sarif
-      displayName: Scan conda packages with Xray
-
-    - task: PublishPipelineArtifact@1
-      inputs:
-        targetPath: xray.sarif
-        artifactName: CodeAnalysisLogs
-      displayName: Publish SARIF Results
-
-    - task: PublishPipelineArtifact@1
-    
-      inputs:
-        targetPath: xray.json
-        artifactName: XrayJsonResults
-      displayName: Publish JSON Results
-
-    - script: |
-        python3 - <<'EOF'
-        import json, sys
-        from collections import defaultdict
-
-        FAIL_ON = {'CRITICAL', 'HIGH'}
-
-        with open('xray.json') as f:
-            results = json.load(f)
-
-        # Collect all vulnerabilities across all packages
-        all_vulns = []
-        for pkg in results:
-            component_id = pkg.get('component_id', 'unknown')
-            for vuln in pkg.get('vulnerabilities', []):
-                all_vulns.append({
-                    'component_id': component_id,
-                    'cve':          vuln.get('cves', [{}])[0].get('cve', 'N/A') if vuln.get('cves') else 'N/A',
-                    'cvss_v3':      vuln.get('cves', [{}])[0].get('cvss_v3_score', 'N/A') if vuln.get('cves') else 'N/A',
-                    'severity':     vuln.get('severity', 'Unknown').upper(),
-                    'issue_id':     vuln.get('issue_id', 'N/A'),
-                    'summary':      vuln.get('summary', '')[:120] + '...',
-                    'fixed_versions': [
-                        fv
-                        for comp in vuln.get('components', {}).values()
-                        for fv in comp.get('fixed_versions', [])
-                    ],
-                })
-
-        if not all_vulns:
-            print("No vulnerabilities found.")
-            sys.exit(0)
-
-        # Group by severity for the summary
-        by_severity = defaultdict(list)
-        for v in all_vulns:
-            by_severity[v['severity']].append(v)
-
-        # Print full report
-        SEV_ORDER = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'UNKNOWN']
-        print(f"\n{'='*70}")
-        print(f" XRAY VULNERABILITY REPORT — {len(all_vulns)} findings")
-        print(f"{'='*70}")
-
-        for sev in SEV_ORDER:
-            vulns = by_severity.get(sev, [])
-            if not vulns:
-                continue
-            print(f"\n── {sev} ({len(vulns)}) {'*** BLOCKING ***' if sev in FAIL_ON else ''}")
-            for v in vulns:
-                fix = ', '.join(v['fixed_versions']) if v['fixed_versions'] else 'no fix listed'
-                print(f"   {v['issue_id']} | {v['cve']} | CVSS {v['cvss_v3']}")
-                print(f"   Package : {v['component_id']}")
-                print(f"   Fix     : {fix}")
-                print(f"   Summary : {v['summary']}")
-                print()
-
-        print(f"{'='*70}")
-        print(f" Summary:")
-        for sev in SEV_ORDER:
-            count = len(by_severity.get(sev, []))
-            if count:
-                marker = ' <-- BLOCKING' if sev in FAIL_ON else ''
-                print(f"   {sev:<10} {count}{marker}")
-        print(f"{'='*70}\n")
-
-        blocking = [v for v in all_vulns if v['severity'] in FAIL_ON]
-        if blocking:
-            print(f"##[error]Pipeline failed: {len(blocking)} {'/'.join(FAIL_ON)} vulnerabilities found.")
-            sys.exit(1)
+        if results is None:
+            out += ['**Results not available.** The scan did not produce results for this build, so no '
+                    'findings can be reported. This does not indicate the absence of vulnerabilities.', '']
         else:
-            print("No blocking vulnerabilities found. Pipeline continues.")
-            sys.exit(0)
-        EOF
-      displayName: Check for vulnerabilities
+            checked = results.get('packages_checked', 0)
+            exceptions = results.get('ignored_cve_count', 0)
+            headline = f"**{plural(len(findings), 'finding')}**" if findings else '**No findings**'
+            headline += f" across {plural(checked, 'package')} checked"
+            if exceptions:
+                headline += f", after {plural(exceptions, 'accepted exception')}"
+            cols = SEV_ORDER[:4] + sorted((s for s in counts if s not in SEV_ORDER[:4]), key=sev_rank)
+            out += [
+                headline + '.', '',
+                '| ' + ' | '.join(cols) + ' |',
+                '|' + '|'.join(':---:' for _ in cols) + '|',
+                '| ' + ' | '.join(str(counts.get(c, 0)) for c in cols) + ' |', '',
+            ]
 
+        out += [
+            '| Scan detail | |', '|---|---|',
+            f'| Date | {scan_date} |',
+            f"| Build | {env['BUILD_NUMBER']} (`{env['BRANCH_NAME']}`) |",
+            '| Tool | JFrog Xray Component Summary API |',
+            f'| Manifest | `{MANIFEST}` |',
+            f"| Status | {env.get('AGENT_JOBSTATUS', 'Unknown')} |",
+            '', '## Findings', '',
+        ]
 
-# see if requires tag
+        if results is None:
+            out.append('No findings can be reported because scan results were not available for this build.')
+        elif findings:
+            out += ['| Severity | Package | Version | Identifier | Summary |',
+                    '|---|---|---|---|---|']
+            for item in sorted(findings, key=lambda x: (sev_rank(x.get('severity')), x.get('component') or '')):
+                name, version = split_component(item.get('component'))
+                cve = item.get('cve')
+                ident = (f'[{cve}](https://nvd.nist.gov/vuln/detail/{cve})' if cve
+                         else cell(item.get('issue_id')))
+                out.append(f"| {cell(item.get('severity') or 'Unknown')} | {cell(name)} | "
+                           f"{cell(version)} | {ident} | {cell(item.get('summary'))} |")
+        else:
+            out.append('No known vulnerabilities were reported for the packages checked, after applying '
+                       'accepted exceptions. See Scan Coverage below for what was and was not checked.')
+
+        out += [
+            '', '## Scan Coverage', '',
+            f'Packages declared in `{MANIFEST}` were looked up in JFrog Xray by PyPI name and version. '
+            'Packages without a pinned version, and conda packages with no PyPI equivalent, are not '
+            'covered by this scan. The absence of a finding is therefore not confirmation that a '
+            'package is free of vulnerabilities.',
+        ]
+
+        os.makedirs(os.path.dirname(env['OUT_PATH']), exist_ok=True)
+        with open(env['OUT_PATH'], 'w') as f:
+            f.write('\n'.join(out) + '\n')
+        print('\n'.join(out))
+        PYEOF
+      displayName: 'Generate SECURITY.md'
+      condition: always()
+      env:
+        ORG_NAME: $(securityOrgName)
+        PROJECT_NAME: $(securityProjectName)
+        GITHUB_ORG: $(github_org)
+        GITHUB_REPO_NAME: $(github_repo_name)
+        MANIFEST_PATH: $(manifestPath)
+        RESULTS_PATH: $(System.DefaultWorkingDirectory)/xray-results.json
+        OUT_PATH: $(Build.ArtifactStagingDirectory)/security/SECURITY.md
+        BUILD_NUMBER: $(Build.BuildNumber)
+        BRANCH_NAME: $(Build.SourceBranchName)
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Attach SECURITY.md to build'
+      condition: always()
+      inputs:
+        targetPath: $(Build.ArtifactStagingDirectory)/security/SECURITY.md
+        artifact: SecurityScanResults
+        publishLocation: pipeline
+
 - stage: Github
   displayName: 'Publish to GitHub'
-  dependsOn: 
-    - Xray
-  condition: and( 
-    succeeded('Xray'), 
-    eq(variables.isMain, true) )
+  dependsOn: Xray
+  condition: and(succeeded('Xray'), eq(variables.isMain, true))
   jobs:
-    - job: Mirror
-      displayName: 'Mirror to GitHub'
-      pool:
-        vmImage: 'ubuntu-latest'
+  - job: Mirror
+    displayName: 'Mirror to GitHub'
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - checkout: self
+      fetchDepth: 0
 
-      steps:
-      - checkout: self
-        fetchDepth: 0   # REQUIRED for full history & tags
+    # Reuse the SECURITY.md attached in the Xray stage
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download generated SECURITY.md'
+      inputs:
+        buildType: current
+        artifactName: SecurityScanResults
+        targetPath: $(Pipeline.Workspace)/SecurityScanResults
 
-      - script: |
-          echo "Configuring GitHub remote..."
+    - bash: |
+        set -euo pipefail
 
-          # Remove existing remote if present
-          git remote remove github 2>/dev/null || true
+        git config user.email "pipeline@azuredevops.local"
+        git config user.name "Azure Pipelines"
 
-          # Add GitHub remote using PAT from ADO Library
-          git remote add github https://$(github_author_token)@github.com/$(github_org)/$(github_repo_name).git
-          echo "Pushing current branch to GitHub..."
-          git push github HEAD:refs/heads/"$BUILD_SOURCEBRANCHNAME" --follow-tags
-        displayName: 'Push Mirror to GitHub'
+        # Remove any other SECURITY.md copies (any case, root/.github/docs) so GitHub
+        # shows only the generated policy, then overwrite the root one.
+        git ls-files | grep -iE '^(\.github/|docs/)?security\.md$' | while IFS= read -r f; do
+          if [ "$f" != "SECURITY.md" ]; then
+            echo "##vso[task.logissue type=warning]Removing $f from the GitHub mirror; replaced by the generated SECURITY.md"
+            git rm -q -- "$f"
+          fi
+        done || true
+        cp -f "$(Pipeline.Workspace)/SecurityScanResults/SECURITY.md" SECURITY.md
+
+        git add SECURITY.md
+        git commit -m "docs: update SECURITY.md with latest scan results [skip ci]" || echo "No changes to commit"
+
+        git remote remove github 2>/dev/null || true
+        git remote add github "https://${GITHUB_TOKEN}@github.com/$(github_org)/$(github_repo_name).git"
+
+        # --force: GitHub is a one-way mirror; the SECURITY.md commit only exists on GitHub,
+        # so without it every run after the first is rejected as non-fast-forward.
+        git push --force --follow-tags github "HEAD:$(Build.SourceBranch)"
+      displayName: 'Push Mirror to GitHub'
+      workingDirectory: $(Build.SourcesDirectory)
+      env:
+        GITHUB_TOKEN: $(github_author_token)

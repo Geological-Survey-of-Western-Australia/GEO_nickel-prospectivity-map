@@ -1,0 +1,126 @@
+# Reusable step: publish a metadata-only build-info record and trigger an
+# Xray build scan, so this pipeline run shows up as a browsable resource in
+# JFrog (Artifactory > Builds), separate from any raw API-based scan.
+#
+# VISIBILITY ONLY: with no real binaries/checksums attached, Xray cannot
+# correlate this build to real vulnerability data -- it reports 0 findings
+# regardless of what's actually in the manifest. This does not replace a
+# real scan (see xray-component-search.yml for that); it only gives the run
+# a clickable home in the JFrog UI.
+#
+# One-time setup per build name, in the JFrog UI: Artifactory > Builds >
+# select build > Add/Remove to Xray > Build -- otherwise scanBuild succeeds
+# but reports the build as unindexed.
+#
+# Requires jfrog_url / jfrog_bot_token in the consuming pipeline.
+
+parameters:
+- name: projectType
+  type: string
+  default: conda
+  values:
+  - conda
+  - pip
+- name: manifestPath
+  type: string
+  default: environment.yml
+
+steps:
+- task: CmdLine@2
+  env:
+    JFROG_URL: $(jfrog_url)
+    JFROG_ACCESS_TOKEN: $(jfrog_bot_token)
+    BUILD_NAME: $(Build.Repository.Name)
+    BUILD_NUMBER: $(Build.BuildId)
+  displayName: Publish build-info and trigger Xray build scan
+  condition: succeededOrFailed()
+  inputs:
+    script: |
+      python3 - <<'PYEOF'
+      import yaml, json, os, sys, datetime, urllib.request, urllib.error
+
+      JFROG_URL = os.environ['JFROG_URL'].rstrip('/')
+      TOKEN = os.environ['JFROG_ACCESS_TOKEN']
+      BUILD_NAME = os.environ['BUILD_NAME']
+      BUILD_NUMBER = os.environ['BUILD_NUMBER']
+
+      PROJECT_TYPE = "${{ parameters.projectType }}"
+      MANIFEST_PATH = "${{ parameters.manifestPath }}"
+
+      def api_call(path, method='GET', payload=None):
+          data = json.dumps(payload).encode() if payload is not None else None
+          req = urllib.request.Request(
+              f"{JFROG_URL}{path}",
+              data=data,
+              headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {TOKEN}'},
+              method=method,
+          )
+          with urllib.request.urlopen(req) as resp:
+              body = resp.read()
+              return resp.status, (json.loads(body) if body else {})
+
+      with open(MANIFEST_PATH) as f:
+          manifest_lines = f.readlines()
+
+      # 'pip' is the real JFrog build-info module type; there's no 'conda'
+      # type, so conda projects borrow it here too (harmless -- this step
+      # never correlates real vulnerability data either way, see above).
+      deps = []
+      seen = set()
+
+      if PROJECT_TYPE == 'conda':
+          env = yaml.safe_load(''.join(manifest_lines))
+          for dep in env.get('dependencies', []):
+              if not isinstance(dep, str):
+                  continue  # skip pip: sub-blocks
+              parts = dep.split('=')
+              name = parts[0]
+              version = parts[1] if len(parts) >= 2 and parts[1] else None
+              if not version or name in seen:
+                  continue
+              seen.add(name)
+              deps.append({'id': f"{name}:{version}", 'type': 'pypi'})
+      elif PROJECT_TYPE == 'pip':
+          for line in manifest_lines:
+              stripped = line.strip()
+              if not stripped or stripped.startswith('#') or '==' not in stripped:
+                  continue  # unpinned / range specs (>=, ~=) not supported
+              name, version = stripped.split('==', 1)
+              name = name.strip()
+              version = version.strip().split(';')[0].split(' ')[0].split('#')[0].strip()
+              if not name or name in seen:
+                  continue
+              seen.add(name)
+              deps.append({'id': f"{name}:{version}", 'type': 'pypi'})
+      else:
+          print(f"Unknown projectType '{PROJECT_TYPE}' -- expected 'conda' or 'pip'")
+          sys.exit(1)
+
+      build_info = {
+          'version': '1.0.1',
+          'name': BUILD_NAME,
+          'number': BUILD_NUMBER,
+          'started': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000+0000'),
+          'modules': [{
+              'id': MANIFEST_PATH,
+              'type': 'pip',
+              'dependencies': deps,
+          }],
+      }
+
+      print(f"Publishing build-info for {BUILD_NAME}/{BUILD_NUMBER} ({len(deps)} dependencies)...")
+      try:
+          status, resp = api_call('/artifactory/api/build', method='PUT', payload=build_info)
+          print(f"  build-publish -> HTTP {status}: {json.dumps(resp)[:500]}")
+      except urllib.error.HTTPError as e:
+          print(f"  build-publish -> HTTP {e.code}: {e.read().decode(errors='replace')[:1000]}")
+          sys.exit(0)  # visibility-only step; never fail the job over this
+
+      print(f"Triggering Xray build scan for {BUILD_NAME}/{BUILD_NUMBER}...")
+      try:
+          status, resp = api_call('/xray/api/v1/scanBuild', method='POST',
+                                   payload={'buildName': BUILD_NAME, 'buildNumber': BUILD_NUMBER})
+          print(f"  scanBuild -> HTTP {status}: {json.dumps(resp)[:1000]}")
+      except urllib.error.HTTPError as e:
+          print(f"  scanBuild -> HTTP {e.code}: {e.read().decode(errors='replace')[:1000]}")
+      PYEOF
