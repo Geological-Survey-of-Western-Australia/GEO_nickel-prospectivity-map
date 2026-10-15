@@ -35,7 +35,7 @@ stages:
         projectType: conda
         manifestPath: environment.yml
 
-    # Capture the scan outcome so the Github stage can read it via output variables
+    # Capture the scan outcome for SECURITY.md
     - bash: |
         echo "##vso[task.setvariable variable=xrayOutcome;isOutput=true]${AGENT_JOBSTATUS}"
         echo "##vso[task.setvariable variable=xrayScanDate;isOutput=true]$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
@@ -43,26 +43,10 @@ stages:
       displayName: 'Capture Xray scan outcome'
       condition: always()
 
-- stage: Github
-  displayName: 'Publish to GitHub'
-  dependsOn: Xray
-  condition: and(succeeded('Xray'), eq(variables.isMain, true))
-  jobs:
-  - job: Mirror
-    displayName: 'Mirror to GitHub'
-    pool:
-      vmImage: ubuntu-latest
-    # Cross-stage output variables must be mapped at job level for stageDependencies to resolve
-    variables:
-      xrayOutcome: $[ stageDependencies.Xray.ScanEnvironment.outputs['CaptureOutcome.xrayOutcome'] ]
-      xrayScanDate: $[ stageDependencies.Xray.ScanEnvironment.outputs['CaptureOutcome.xrayScanDate'] ]
-    steps:
-    - checkout: self
-      fetchDepth: 0
-
+    # Generated and attached on every build, on every branch
     - bash: |
         set -euo pipefail
-        cat > "$(Build.SourcesDirectory)/SECURITY.md" << 'EOF'
+        cat > "$(Build.ArtifactStagingDirectory)/SECURITY.md" << 'EOF'
         # Security
 
         ## Security Notice
@@ -78,18 +62,40 @@ stages:
         | Manifest Scanned | environment.yml |
         | Build Number | $(Build.BuildNumber) |
         | Branch | $(Build.SourceBranchName) |
-        | Scan Date (UTC) | $(xrayScanDate) |
-        | Outcome | $(xrayOutcome) |
+        | Scan Date (UTC) | $(CaptureOutcome.xrayScanDate) |
+        | Outcome | $(CaptureOutcome.xrayOutcome) |
         EOF
       displayName: 'Generate SECURITY.md'
+      condition: always()
 
     - task: PublishPipelineArtifact@1
-      displayName: 'Publish SECURITY.md as pipeline artifact'
+      displayName: 'Attach SECURITY.md to build'
       inputs:
-        targetPath: '$(Build.SourcesDirectory)/SECURITY.md'
+        targetPath: '$(Build.ArtifactStagingDirectory)/SECURITY.md'
         artifact: 'SecurityScanResults'
         publishLocation: 'pipeline'
       condition: always()
+
+- stage: Github
+  displayName: 'Publish to GitHub'
+  dependsOn: Xray
+  condition: and(succeeded('Xray'), eq(variables.isMain, true))
+  jobs:
+  - job: Mirror
+    displayName: 'Mirror to GitHub'
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - checkout: self
+      fetchDepth: 0
+
+    # Reuse the SECURITY.md attached in the Xray stage, placed at the repo root
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download SECURITY.md to repo root'
+      inputs:
+        buildType: current
+        artifactName: SecurityScanResults
+        targetPath: $(Build.SourcesDirectory)
 
     - bash: |
         set -euo pipefail
