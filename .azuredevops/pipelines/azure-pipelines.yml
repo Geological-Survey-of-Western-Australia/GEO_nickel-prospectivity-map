@@ -13,6 +13,9 @@ variables:
   value: $[contains(variables['Build.SourceBranch'], 'releases/')]
 - name: isCICD
   value: $[contains(variables['Build.SourceBranch'], 'cicd')]
+# Used in the public SECURITY.md
+- name: securityOrgName
+  value: 'Geological Survey of Western Australia'
 
 stages:
 - stage: Xray
@@ -43,30 +46,137 @@ stages:
       displayName: 'Capture Xray scan outcome'
       condition: always()
 
-    # Generated and attached on every build, on every branch
+    # Builds SECURITY.md from xray-results.json (written by the scan template).
+    # Generated and attached on every build, on every branch.
     - bash: |
         set -euo pipefail
-        cat > "$(Build.ArtifactStagingDirectory)/SECURITY.md" << 'EOF'
-        # Security
+        python3 - <<'PYEOF'
+        import json, os
 
-        ## Security Notice
+        env = os.environ
+        WATCH = env['WATCH_NAME']
+        MANIFEST = env['MANIFEST_PATH']
+        ORG = env['SECURITY_ORG_NAME'].strip()
+        REPO = f"{env['GITHUB_ORG']}/{env['GITHUB_REPO_NAME']}"
+        SEV_ORDER = ['Critical', 'High', 'Medium', 'Low', 'Unknown']
 
-        Security scanning was performed during the development and build process. The results reflect the state of the product at the time the scans were undertaken. Security scans may not identify all vulnerabilities and may be subject to false positives or false negatives. Unless otherwise stated, no additional security scanning, validation or assurance activities have been undertaken following completion of the build process. Users are responsible for conducting their own testing, validation and security assessment before deploying or relying on this product.
+        NOTICE = (
+            "Security scanning was performed during the development and build process. "
+            "The results reflect the state of the product at the time the scans were undertaken. "
+            "Security scans may not identify all vulnerabilities and may be subject to false positives "
+            "or false negatives. Unless otherwise stated, no additional security scanning, validation or "
+            "assurance activities have been undertaken following completion of the build process. "
+            "Users are responsible for conducting their own testing, validation and security assessment "
+            "before deploying or relying on this product."
+        )
 
-        ## Scan Summary
+        def cell(text, limit=160):
+            text = ' '.join(str(text or '').split())
+            if len(text) > limit:
+                text = text[:limit - 1].rstrip() + '\u2026'
+            return text.replace('|', '\\|') or '-'
 
-        | Field | Value |
-        |---|---|
-        | Scan Tool | JFrog Xray |
-        | Watch | gsrsd_watch |
-        | Manifest Scanned | environment.yml |
-        | Build Number | $(Build.BuildNumber) |
-        | Branch | $(Build.SourceBranchName) |
-        | Scan Date (UTC) | $(CaptureOutcome.xrayScanDate) |
-        | Outcome | $(CaptureOutcome.xrayOutcome) |
-        EOF
+        def split_component(component_id):
+            cid = (component_id or '').split('://', 1)[-1]
+            name, _, version = cid.rpartition(':')
+            return (name, version) if name else (cid, '')
+
+        def sev_rank(sev):
+            return SEV_ORDER.index(sev) if sev in SEV_ORDER else len(SEV_ORDER)
+
+        try:
+            with open(env['RESULTS_PATH']) as f:
+                results = json.load(f)
+        except (OSError, ValueError):
+            results = None
+
+        findings = (results or {}).get('findings') or []
+        counts = {}
+        for item in findings:
+            sev = item.get('severity') or 'Unknown'
+            counts[sev] = counts.get(sev, 0) + 1
+        breakdown = ', '.join(f"{counts[s]} {s}" for s in sorted(counts, key=sev_rank))
+
+        out = [
+            '# Security Policy', '',
+            f'This security policy applies to the [{REPO}](https://github.com/{REPO}) repository on GitHub, '
+            f'published by the {ORG}. The code is provided for transparency purposes only. The repository '
+            'is archived on release and is not actively maintained.', '',
+            '## Security Notice', '', NOTICE, '',
+            '## Security/Bugfix Versions', '',
+            'No security or bug fixes are provided for this project. Because the repository is archived on '
+            'release, reported vulnerabilities will not result in patches or new versions. If you use this '
+            'code, you are responsible for maintaining your own copy, including updating dependencies and '
+            'applying any fixes.', '',
+            '## Scan Summary', '',
+            '| Field | Value |', '|---|---|',
+            '| Scan Tool | JFrog Xray (Component Summary API) |',
+            f'| Watch | {WATCH} |',
+            f'| Manifest Scanned | {MANIFEST} |',
+            f"| Build Number | {env['BUILD_NUMBER']} |",
+            f"| Branch | {env['BRANCH_NAME']} |",
+            f"| Scan Date (UTC) | {env['SCAN_DATE']} |",
+            f"| Scan Status | {env['SCAN_STATUS']} |",
+        ]
+
+        if results is None:
+            out += [
+                '| Findings | Not available |', '',
+                '## Findings', '',
+                'Scan results were not available for this build, so no findings can be reported. '
+                'This does not indicate the absence of vulnerabilities.',
+            ]
+        else:
+            total = len(findings)
+            out += [
+                f"| Packages Checked | {results.get('packages_checked', 0)} |",
+                f"| Accepted Exceptions Applied | {results.get('ignored_cve_count', 0)} CVE(s) |",
+                f"| Findings | {total}{f' ({breakdown})' if total else ''} |",
+                '', '## Findings', '',
+            ]
+            if findings:
+                out += ['| Severity | Package | Version | Identifier | Summary |',
+                        '|---|---|---|---|---|']
+                for item in sorted(findings, key=lambda x: (sev_rank(x.get('severity')), x.get('component') or '')):
+                    name, version = split_component(item.get('component'))
+                    cve = item.get('cve')
+                    ident = (f'[{cve}](https://nvd.nist.gov/vuln/detail/{cve})' if cve
+                             else cell(item.get('issue_id')))
+                    out.append(f"| {cell(item.get('severity') or 'Unknown')} | {cell(name)} | "
+                               f"{cell(version)} | {ident} | {cell(item.get('summary'))} |")
+            else:
+                out.append(
+                    f'No known vulnerabilities were reported for the packages checked, after applying '
+                    f'accepted exceptions on the `{WATCH}` watch. See Scan Coverage below for what was '
+                    f'and was not checked.'
+                )
+
+        out += [
+            '', '## Scan Coverage', '',
+            f'Packages declared in `{MANIFEST}` were looked up in JFrog Xray by PyPI name and version. '
+            'Packages without a pinned version, and conda packages with no PyPI equivalent, are not '
+            'covered by this scan. The absence of a finding is therefore not confirmation that a '
+            'package is free of vulnerabilities.',
+        ]
+
+        with open(env['OUT_PATH'], 'w') as f:
+            f.write('\n'.join(out) + '\n')
+        print('\n'.join(out))
+        PYEOF
       displayName: 'Generate SECURITY.md'
       condition: always()
+      env:
+        RESULTS_PATH: $(System.DefaultWorkingDirectory)/xray-results.json
+        OUT_PATH: $(Build.ArtifactStagingDirectory)/SECURITY.md
+        WATCH_NAME: gsrsd_watch
+        MANIFEST_PATH: environment.yml
+        BUILD_NUMBER: $(Build.BuildNumber)
+        BRANCH_NAME: $(Build.SourceBranchName)
+        SCAN_DATE: $(CaptureOutcome.xrayScanDate)
+        SCAN_STATUS: $(CaptureOutcome.xrayOutcome)
+        SECURITY_ORG_NAME: $(securityOrgName)
+        GITHUB_ORG: $(github_org)
+        GITHUB_REPO_NAME: $(github_repo_name)
 
     - task: PublishPipelineArtifact@1
       displayName: 'Attach SECURITY.md to build'
