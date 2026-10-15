@@ -13,9 +13,14 @@ variables:
   value: $[contains(variables['Build.SourceBranch'], 'releases/')]
 - name: isCICD
   value: $[contains(variables['Build.SourceBranch'], 'cicd')]
-# Used in the public SECURITY.md
+
+# --- SECURITY.md settings: change these when reusing this pipeline ---
 - name: securityOrgName
   value: 'Geological Survey of Western Australia'
+- name: securityProjectName
+  value: 'nickel prospectivity mapping'   # leave '' to use the repo name
+- name: manifestPath
+  value: 'environment.yml'
 
 stages:
 - stage: Xray
@@ -29,46 +34,30 @@ stages:
     - template: templates/xray-component-search.yml
       parameters:
         projectType: conda
-        manifestPath: environment.yml
+        manifestPath: ${{ variables.manifestPath }}
         watchName: gsrsd_watch
         failOnVulnerabilities: false
 
     - template: templates/xray-build-info-publish.yml
       parameters:
         projectType: conda
-        manifestPath: environment.yml
+        manifestPath: ${{ variables.manifestPath }}
 
-    # Capture the scan outcome for SECURITY.md
-    - bash: |
-        echo "##vso[task.setvariable variable=xrayOutcome;isOutput=true]${AGENT_JOBSTATUS}"
-        echo "##vso[task.setvariable variable=xrayScanDate;isOutput=true]$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-      name: CaptureOutcome
-      displayName: 'Capture Xray scan outcome'
-      condition: always()
-
-    # Builds SECURITY.md from xray-results.json (written by the scan template).
-    # Generated and attached on every build, on every branch.
+    # Build the public SECURITY.md from xray-results.json and attach it to the run
     - bash: |
         set -euo pipefail
         python3 - <<'PYEOF'
         import datetime, json, os
 
         env = os.environ
-        WATCH = env['WATCH_NAME']
+        ORG = env['ORG_NAME'].strip()
+        REPO_NAME = env['GITHUB_REPO_NAME'].strip()
+        REPO_URL = f"https://github.com/{env['GITHUB_ORG'].strip()}/{REPO_NAME}"
+        PROJECT = env['PROJECT_NAME'].strip()
+        if not PROJECT or PROJECT.startswith('$('):   # unset variable -> fall back to repo name
+            PROJECT = REPO_NAME.replace('-', ' ').replace('_', ' ')
         MANIFEST = env['MANIFEST_PATH']
-        ORG = env['SECURITY_ORG_NAME'].strip()
-        REPO = f"{env['GITHUB_ORG']}/{env['GITHUB_REPO_NAME']}"
         SEV_ORDER = ['Critical', 'High', 'Medium', 'Low', 'Unknown']
-
-        NOTICE = (
-            "Security scanning was performed during the development and build process. "
-            "The results reflect the state of the product at the time the scans were undertaken. "
-            "Security scans may not identify all vulnerabilities and may be subject to false positives "
-            "or false negatives. Unless otherwise stated, no additional security scanning, validation or "
-            "assurance activities have been undertaken following completion of the build process. "
-            "Users are responsible for conducting their own testing, validation and security assessment "
-            "before deploying or relying on this product."
-        )
 
         def cell(text, limit=160):
             text = ' '.join(str(text or '').split())
@@ -84,6 +73,9 @@ stages:
         def sev_rank(sev):
             return SEV_ORDER.index(sev) if sev in SEV_ORDER else len(SEV_ORDER)
 
+        def plural(n, word):
+            return f'{n} {word}' + ('' if n == 1 else 's')
+
         try:
             with open(env['RESULTS_PATH']) as f:
                 results = json.load(f)
@@ -95,30 +87,31 @@ stages:
         for item in findings:
             sev = item.get('severity') or 'Unknown'
             counts[sev] = counts.get(sev, 0) + 1
-        breakdown = ', '.join(f"{counts[s]} {s}" for s in sorted(counts, key=sev_rank))
+
+        scan_date = datetime.datetime.now(datetime.timezone.utc).strftime('%d %B %Y, %H:%M UTC')
 
         out = [
             '# Security Policy', '',
-            f'This security policy applies to the [{REPO}](https://github.com/{REPO}) repository on GitHub, '
-            f'published by the {ORG}. The code is provided for transparency purposes only. The repository '
-            'is archived on release and is not actively maintained.', '',
-            '## Security Notice', '', NOTICE, '',
+            f'This security policy applies to the {ORG} {PROJECT} repository on GitHub '
+            f'([{REPO_NAME}]({REPO_URL})), published by the {ORG}. The code is made publicly available to '
+            'support transparency and reproducibility of the associated work. The repository is archived on '
+            'release and is not actively maintained or supported.', '',
+            '## Security Notice', '',
+            'Security scanning was performed during the development and build process. The results reflect '
+            'the state of the product and its dependencies at the time the scans were performed.', '',
+            'Security scans may not identify all vulnerabilities and may be subject to false positives or '
+            'false negatives. Unless otherwise stated, no additional security scanning, validation, monitoring '
+            'or assurance activities have been undertaken following completion of the build process. Users are '
+            'responsible for conducting their own testing, validation and security assessment before deploying, '
+            'implementing or otherwise relying on this product.', '',
             '## Security/Bugfix Versions', '',
             'No security or bug fixes are provided for this project. Because the repository is archived on '
             'release, reported vulnerabilities will not result in patches or new versions. If you use this '
             'code, you are responsible for maintaining your own copy, including updating dependencies and '
             'applying any fixes.', '',
+            '## Scan Summary', '',
         ]
 
-        def plural(n, word):
-            return f'{n} {word}' + ('' if n == 1 else 's')
-
-        try:
-            scan_date = datetime.datetime.strptime(env['SCAN_DATE'], '%Y-%m-%dT%H:%M:%SZ').strftime('%d %B %Y, %H:%M UTC')
-        except ValueError:
-            scan_date = env['SCAN_DATE']
-
-        out += ['## Scan Summary', '']
         if results is None:
             out += ['**Results not available.** The scan did not produce results for this build, so no '
                     'findings can be reported. This does not indicate the absence of vulnerabilities.', '']
@@ -143,7 +136,7 @@ stages:
             f"| Build | {env['BUILD_NUMBER']} (`{env['BRANCH_NAME']}`) |",
             '| Tool | JFrog Xray Component Summary API |',
             f'| Manifest | `{MANIFEST}` |',
-            f"| Status | {env['SCAN_STATUS']} |",
+            f"| Status | {env.get('AGENT_JOBSTATUS', 'Unknown')} |",
             '', '## Findings', '',
         ]
 
@@ -160,10 +153,8 @@ stages:
                 out.append(f"| {cell(item.get('severity') or 'Unknown')} | {cell(name)} | "
                            f"{cell(version)} | {ident} | {cell(item.get('summary'))} |")
         else:
-            out.append(
-                'No known vulnerabilities were reported for the packages checked, after applying '
-                'accepted exceptions. See Scan Coverage below for what was and was not checked.'
-            )
+            out.append('No known vulnerabilities were reported for the packages checked, after applying '
+                       'accepted exceptions. See Scan Coverage below for what was and was not checked.')
 
         out += [
             '', '## Scan Coverage', '',
@@ -173,6 +164,7 @@ stages:
             'package is free of vulnerabilities.',
         ]
 
+        os.makedirs(os.path.dirname(env['OUT_PATH']), exist_ok=True)
         with open(env['OUT_PATH'], 'w') as f:
             f.write('\n'.join(out) + '\n')
         print('\n'.join(out))
@@ -180,25 +172,23 @@ stages:
       displayName: 'Generate SECURITY.md'
       condition: always()
       env:
-        RESULTS_PATH: $(System.DefaultWorkingDirectory)/xray-results.json
-        OUT_PATH: $(Build.ArtifactStagingDirectory)/SECURITY.md
-        WATCH_NAME: gsrsd_watch
-        MANIFEST_PATH: environment.yml
-        BUILD_NUMBER: $(Build.BuildNumber)
-        BRANCH_NAME: $(Build.SourceBranchName)
-        SCAN_DATE: $(CaptureOutcome.xrayScanDate)
-        SCAN_STATUS: $(CaptureOutcome.xrayOutcome)
-        SECURITY_ORG_NAME: $(securityOrgName)
+        ORG_NAME: $(securityOrgName)
+        PROJECT_NAME: $(securityProjectName)
         GITHUB_ORG: $(github_org)
         GITHUB_REPO_NAME: $(github_repo_name)
+        MANIFEST_PATH: $(manifestPath)
+        RESULTS_PATH: $(System.DefaultWorkingDirectory)/xray-results.json
+        OUT_PATH: $(Build.ArtifactStagingDirectory)/security/SECURITY.md
+        BUILD_NUMBER: $(Build.BuildNumber)
+        BRANCH_NAME: $(Build.SourceBranchName)
 
     - task: PublishPipelineArtifact@1
       displayName: 'Attach SECURITY.md to build'
-      inputs:
-        targetPath: '$(Build.ArtifactStagingDirectory)/SECURITY.md'
-        artifact: 'SecurityScanResults'
-        publishLocation: 'pipeline'
       condition: always()
+      inputs:
+        targetPath: $(Build.ArtifactStagingDirectory)/security/SECURITY.md
+        artifact: SecurityScanResults
+        publishLocation: pipeline
 
 - stage: Github
   displayName: 'Publish to GitHub'
