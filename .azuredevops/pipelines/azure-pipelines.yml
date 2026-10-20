@@ -1,0 +1,242 @@
+trigger:
+  batch: true
+  branches:
+    include:
+    - '*'
+
+variables:
+- group: gswa-jfrog                 # requires: jfrog_url, jfrog_bot_token
+- group: nickel-prospectivity-maps  # requires: github_author_token, github_org, github_repo_name
+- name: isMain
+  value: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
+- name: isRC
+  value: $[contains(variables['Build.SourceBranch'], 'releases/')]
+- name: isCICD
+  value: $[contains(variables['Build.SourceBranch'], 'cicd')]
+
+# --- SECURITY.md settings: change these when reusing this pipeline ---
+- name: securityOrgName
+  value: 'Geological Survey of Western Australia'
+- name: securityProjectName
+  value: 'nickel prospectivity mapping'   # leave '' to use the repo name
+- name: manifestPath
+  value: 'environment.yml'
+
+stages:
+- stage: Xray
+  displayName: Xray Scan
+  jobs:
+  - job: ScanEnvironment
+    displayName: Scan environment.yml
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - template: templates/xray-component-search.yml
+      parameters:
+        projectType: conda
+        manifestPath: ${{ variables.manifestPath }}
+        watchName: gsrsd_watch
+        failOnVulnerabilities: false
+
+    - template: templates/xray-build-info-publish.yml
+      parameters:
+        projectType: conda
+        manifestPath: ${{ variables.manifestPath }}
+
+    # Build the public SECURITY.md from xray-results.json and attach it to the run
+    - bash: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        import datetime, json, os
+
+        env = os.environ
+        ORG = env['ORG_NAME'].strip()
+        REPO_NAME = env['GITHUB_REPO_NAME'].strip()
+        REPO_URL = f"https://github.com/{env['GITHUB_ORG'].strip()}/{REPO_NAME}"
+        PROJECT = env['PROJECT_NAME'].strip()
+        if not PROJECT or PROJECT.startswith('$('):   # unset variable -> fall back to repo name
+            PROJECT = REPO_NAME.replace('-', ' ').replace('_', ' ')
+        MANIFEST = env['MANIFEST_PATH']
+        SEV_ORDER = ['Critical', 'High', 'Medium', 'Low', 'Unknown']
+
+        def cell(text, limit=160):
+            text = ' '.join(str(text or '').split())
+            if len(text) > limit:
+                text = text[:limit - 1].rstrip() + '\u2026'
+            return text.replace('|', '\\|') or '-'
+
+        def split_component(component_id):
+            cid = (component_id or '').split('://', 1)[-1]
+            name, _, version = cid.rpartition(':')
+            return (name, version) if name else (cid, '')
+
+        def sev_rank(sev):
+            return SEV_ORDER.index(sev) if sev in SEV_ORDER else len(SEV_ORDER)
+
+        def plural(n, word):
+            return f'{n} {word}' + ('' if n == 1 else 's')
+
+        try:
+            with open(env['RESULTS_PATH']) as f:
+                results = json.load(f)
+        except (OSError, ValueError):
+            results = None
+
+        findings = (results or {}).get('findings') or []
+        counts = {}
+        for item in findings:
+            sev = item.get('severity') or 'Unknown'
+            counts[sev] = counts.get(sev, 0) + 1
+
+        scan_date = datetime.datetime.now(datetime.timezone.utc).strftime('%d %B %Y, %H:%M UTC')
+
+        out = [
+            '# Security Policy', '',
+            f'This security policy applies to the {ORG} {PROJECT} repository on GitHub '
+            f'([{REPO_NAME}]({REPO_URL})), published by the {ORG}. The code is made publicly available to '
+            'support transparency and reproducibility of the associated work. The repository is archived on '
+            'release and is not actively maintained or supported.', '',
+            '## Security Notice', '',
+            'Security scanning was performed during the development and build process. The results reflect '
+            'the state of the product and its dependencies at the time the scans were performed.', '',
+            'Security scans may not identify all vulnerabilities and may be subject to false positives or '
+            'false negatives. Unless otherwise stated, no additional security scanning, validation, monitoring '
+            'or assurance activities have been undertaken following completion of the build process. Users are '
+            'responsible for conducting their own testing, validation and security assessment before deploying, '
+            'implementing or otherwise relying on this product.', '',
+            '## Security/Bugfix Versions', '',
+            'No security or bug fixes are provided for this project. Because the repository is archived on '
+            'release, reported vulnerabilities will not result in patches or new versions. If you use this '
+            'code, you are responsible for maintaining your own copy, including updating dependencies and '
+            'applying any fixes.', '',
+            '## Scan Summary', '',
+        ]
+
+        if results is None:
+            out += ['**Results not available.** The scan did not produce results for this build, so no '
+                    'findings can be reported. This does not indicate the absence of vulnerabilities.', '']
+        else:
+            checked = results.get('packages_checked', 0)
+            exceptions = results.get('ignored_cve_count', 0)
+            headline = f"**{plural(len(findings), 'finding')}**" if findings else '**No findings**'
+            headline += f" across {plural(checked, 'package')} checked"
+            if exceptions:
+                headline += f", after {plural(exceptions, 'accepted exception')}"
+            cols = SEV_ORDER[:4] + sorted((s for s in counts if s not in SEV_ORDER[:4]), key=sev_rank)
+            out += [
+                headline + '.', '',
+                '| ' + ' | '.join(cols) + ' |',
+                '|' + '|'.join(':---:' for _ in cols) + '|',
+                '| ' + ' | '.join(str(counts.get(c, 0)) for c in cols) + ' |', '',
+            ]
+
+        out += [
+            '| Scan detail | |', '|---|---|',
+            f'| Date | {scan_date} |',
+            f"| Build | {env['BUILD_NUMBER']} (`{env['BRANCH_NAME']}`) |",
+            '| Tool | JFrog Xray Component Summary API |',
+            f'| Manifest | `{MANIFEST}` |',
+            f"| Status | {env.get('AGENT_JOBSTATUS', 'Unknown')} |",
+            '', '## Findings', '',
+        ]
+
+        if results is None:
+            out.append('No findings can be reported because scan results were not available for this build.')
+        elif findings:
+            out += ['| Severity | Package | Version | Identifier | Summary |',
+                    '|---|---|---|---|---|']
+            for item in sorted(findings, key=lambda x: (sev_rank(x.get('severity')), x.get('component') or '')):
+                name, version = split_component(item.get('component'))
+                cve = item.get('cve')
+                ident = (f'[{cve}](https://nvd.nist.gov/vuln/detail/{cve})' if cve
+                         else cell(item.get('issue_id')))
+                out.append(f"| {cell(item.get('severity') or 'Unknown')} | {cell(name)} | "
+                           f"{cell(version)} | {ident} | {cell(item.get('summary'))} |")
+        else:
+            out.append('No known vulnerabilities were reported for the packages checked, after applying '
+                       'accepted exceptions. See Scan Coverage below for what was and was not checked.')
+
+        out += [
+            '', '## Scan Coverage', '',
+            f'Packages declared in `{MANIFEST}` were looked up in JFrog Xray by PyPI name and version. '
+            'Packages without a pinned version, and conda packages with no PyPI equivalent, are not '
+            'covered by this scan. The absence of a finding is therefore not confirmation that a '
+            'package is free of vulnerabilities.',
+        ]
+
+        os.makedirs(os.path.dirname(env['OUT_PATH']), exist_ok=True)
+        with open(env['OUT_PATH'], 'w') as f:
+            f.write('\n'.join(out) + '\n')
+        print('\n'.join(out))
+        PYEOF
+      displayName: 'Generate SECURITY.md'
+      condition: always()
+      env:
+        ORG_NAME: $(securityOrgName)
+        PROJECT_NAME: $(securityProjectName)
+        GITHUB_ORG: $(github_org)
+        GITHUB_REPO_NAME: $(github_repo_name)
+        MANIFEST_PATH: $(manifestPath)
+        RESULTS_PATH: $(System.DefaultWorkingDirectory)/xray-results.json
+        OUT_PATH: $(Build.ArtifactStagingDirectory)/security/SECURITY.md
+        BUILD_NUMBER: $(Build.BuildNumber)
+        BRANCH_NAME: $(Build.SourceBranchName)
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Attach SECURITY.md to build'
+      condition: always()
+      inputs:
+        targetPath: $(Build.ArtifactStagingDirectory)/security/SECURITY.md
+        artifact: SecurityScanResults
+        publishLocation: pipeline
+
+- stage: Github
+  displayName: 'Publish to GitHub'
+  dependsOn: Xray
+  condition: and(succeeded('Xray'), eq(variables.isMain, true))
+  jobs:
+  - job: Mirror
+    displayName: 'Mirror to GitHub'
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - checkout: self
+      fetchDepth: 0
+
+    # Reuse the SECURITY.md attached in the Xray stage
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download generated SECURITY.md'
+      inputs:
+        buildType: current
+        artifactName: SecurityScanResults
+        targetPath: $(Pipeline.Workspace)/SecurityScanResults
+
+    - bash: |
+        set -euo pipefail
+
+        git config user.email "pipeline@azuredevops.local"
+        git config user.name "Azure Pipelines"
+
+        # Remove any other SECURITY.md copies (any case, root/.github/docs) so GitHub
+        # shows only the generated policy, then overwrite the root one.
+        git ls-files | grep -iE '^(\.github/|docs/)?security\.md$' | while IFS= read -r f; do
+          if [ "$f" != "SECURITY.md" ]; then
+            echo "##vso[task.logissue type=warning]Removing $f from the GitHub mirror; replaced by the generated SECURITY.md"
+            git rm -q -- "$f"
+          fi
+        done || true
+        cp -f "$(Pipeline.Workspace)/SecurityScanResults/SECURITY.md" SECURITY.md
+
+        git add SECURITY.md
+        git commit -m "docs: update SECURITY.md with latest scan results [skip ci]" || echo "No changes to commit"
+
+        git remote remove github 2>/dev/null || true
+        git remote add github "https://${GITHUB_TOKEN}@github.com/$(github_org)/$(github_repo_name).git"
+
+        # --force: GitHub is a one-way mirror; the SECURITY.md commit only exists on GitHub,
+        # so without it every run after the first is rejected as non-fast-forward.
+        git push --force --follow-tags github "HEAD:$(Build.SourceBranch)"
+      displayName: 'Push Mirror to GitHub'
+      workingDirectory: $(Build.SourcesDirectory)
+      env:
+        GITHUB_TOKEN: $(github_author_token)

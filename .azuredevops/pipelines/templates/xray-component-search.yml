@@ -1,0 +1,369 @@
+# Reusable Xray Component Search step template.
+#
+# Looks up every package in a conda environment.yml or pip requirements.txt
+# against JFrog Xray's Component Summary API (a checksum-free identity
+# lookup -- no download/install needed), drops anything already covered by
+# an accepted Ignore Rule on the given watch, and always publishes the raw
+# results (XrayResults), a SARIF file (CodeAnalysisLogs), and a plain-text
+# disclaimer/summary (XrayDisclaimer).
+#
+# Default mode is transparency, not enforcement: failOnVulnerabilities:
+# false just reports findings. Set it true to gate the build on findings at
+# or above blockingSeverities instead (e.g. for a real hosted service).
+#
+# LIMITATION: only pypi:// component ids return real data from this API --
+# conda:// and generic:// always come back empty (no binary for Xray to
+# fingerprint). Conda packages with no PyPI equivalent get zero coverage
+# here regardless of settings. See docs/xray-conda-coverage-proposal.md in
+# GEO_nickel_prospectivity_mapping for the real-binary-scan alternative
+# (closes this gap, costs ~20-40x the runtime).
+#
+# Requires jfrog_url / jfrog_bot_token in the consuming pipeline (e.g. via
+# the gswa-jfrog variable group).
+
+parameters:
+- name: projectType
+  type: string
+  default: conda
+  values:
+  - conda
+  - pip
+- name: manifestPath
+  type: string
+  default: environment.yml
+- name: watchName
+  type: string
+  default: gsrsd_watch
+- name: failOnVulnerabilities
+  type: boolean
+  default: false
+- name: blockingSeverities
+  type: string
+  default: 'Critical,High'
+
+steps:
+- task: CmdLine@2
+  env:
+    JFROG_URL: $(jfrog_url)
+    JFROG_ACCESS_TOKEN: $(jfrog_bot_token)
+    BUILD_REPO: $(Build.Repository.Name)
+  displayName: 'Query Xray Component Search (${{ parameters.projectType }})'
+  inputs:
+    script: |
+      python3 - <<'PYEOF'
+      import yaml, json, os, sys, datetime, urllib.request, urllib.error
+
+      JFROG_URL = os.environ['JFROG_URL'].rstrip('/')
+      TOKEN = os.environ['JFROG_ACCESS_TOKEN']
+      BUILD_REPO = os.environ.get('BUILD_REPO', 'unknown-repo')
+
+      PROJECT_TYPE = "${{ parameters.projectType }}"
+      MANIFEST_PATH = "${{ parameters.manifestPath }}"
+      WATCH_NAME = "${{ parameters.watchName }}"
+      FAIL_ON_VULNERABILITIES = "${{ parameters.failOnVulnerabilities }}".strip().lower() == 'true'
+      BLOCKING_SEVERITIES = {s.strip() for s in "${{ parameters.blockingSeverities }}".split(',') if s.strip()}
+      BATCH_SIZE = 100
+
+      def api_call(path, method='GET', payload=None):
+          data = json.dumps(payload).encode() if payload is not None else None
+          req = urllib.request.Request(
+              f"{JFROG_URL}{path}",
+              data=data,
+              headers={
+                  'Content-Type': 'application/json',
+                  'Authorization': f'Bearer {TOKEN}',
+              },
+              method=method,
+          )
+          with urllib.request.urlopen(req) as resp:
+              body = resp.read()
+              return json.loads(body) if body else {}
+
+      # --- 1. Parse the manifest ---------------------------------------
+      with open(MANIFEST_PATH) as f:
+          manifest_lines = f.readlines()
+
+      packages = []
+      seen = set()
+      line_for_name = {}
+
+      if PROJECT_TYPE == 'conda':
+          env = yaml.safe_load(''.join(manifest_lines))
+          for lineno, line in enumerate(manifest_lines, start=1):
+              stripped = line.strip()
+              if stripped.startswith('- '):
+                  dep_name = stripped[2:].split('=')[0].strip()
+                  if dep_name:
+                      line_for_name.setdefault(dep_name, lineno)
+          for dep in env.get('dependencies', []):
+              if not isinstance(dep, str):
+                  continue  # skip pip: sub-blocks
+              parts = dep.split('=')
+              name = parts[0]
+              version = parts[1] if len(parts) >= 2 and parts[1] else None
+              if not version or name in seen:
+                  continue
+              seen.add(name)
+              packages.append({'name': name, 'version': version})
+      elif PROJECT_TYPE == 'pip':
+          for lineno, line in enumerate(manifest_lines, start=1):
+              stripped = line.strip()
+              if not stripped or stripped.startswith('#'):
+                  continue
+              if '==' not in stripped:
+                  continue  # unpinned / range specs (>=, ~=) not supported
+              name, version = stripped.split('==', 1)
+              name = name.strip()
+              version = version.strip().split(';')[0].split(' ')[0].split('#')[0].strip()
+              if not name or name in seen:
+                  continue
+              seen.add(name)
+              line_for_name.setdefault(name, lineno)
+              packages.append({'name': name, 'version': version})
+      else:
+          print(f"Unknown projectType '{PROJECT_TYPE}' -- expected 'conda' or 'pip'")
+          sys.exit(1)
+
+      print(f"Parsed {len(packages)} unique versioned packages from {MANIFEST_PATH} ({PROJECT_TYPE})")
+
+      # --- 2. Query the Xray Component Summary API in batches -----------
+      components_data = []
+      for i in range(0, len(packages), BATCH_SIZE):
+          batch = packages[i:i + BATCH_SIZE]
+          payload = {
+              'component_details': [
+                  {'component_id': f"pypi://{p['name']}:{p['version']}"}
+                  for p in batch
+              ]
+          }
+          print(f"Querying Xray for packages {i + 1}-{i + len(batch)} of {len(packages)}...")
+          try:
+              result = api_call('/xray/api/v1/summary/component', method='POST', payload=payload)
+          except urllib.error.HTTPError as e:
+              print(f"  HTTP {e.code}: {e.read().decode(errors='replace')[:300]}")
+              continue
+          artifacts = result.get('artifacts', []) if isinstance(result, dict) else []
+          components_data.extend(artifacts)
+
+      print(f"Xray returned data for {len(components_data)} component lookups")
+
+      # --- 3. Fetch ignore rules for the watch ---------------------------
+      try:
+          ignore_rules_raw = api_call('/xray/api/v1/ignore_rules')
+      except urllib.error.HTTPError as e:
+          print(f"Could not fetch ignore rules (HTTP {e.code}): {e.read().decode(errors='replace')[:300]}")
+          ignore_rules_raw = {}
+
+      if isinstance(ignore_rules_raw, dict):
+          ignore_rules = ignore_rules_raw.get('data', [])
+      else:
+          ignore_rules = ignore_rules_raw or []
+      if not isinstance(ignore_rules, list):
+          ignore_rules = []
+
+      def rule_applies_to_watch(rule):
+          watches = rule.get('watches') or rule.get('watch_names') or []
+          return not watches or WATCH_NAME in watches
+
+      def rule_cves(rule):
+          vulns = rule.get('vulnerabilities') or rule.get('cves') or []
+          out = set()
+          for v in vulns:
+              out.add(v if isinstance(v, str) else (v.get('cve') or v.get('id')))
+          return {v for v in out if v}
+
+      ignored_cves = set()
+      for rule in ignore_rules:
+          if rule.get('is_expired'):
+              continue
+          if not rule_applies_to_watch(rule):
+              continue
+          ignored_cves |= rule_cves(rule)
+
+      print(f"Loaded {len(ignored_cves)} actively-ignored CVE(s) for watch '{WATCH_NAME}'")
+
+      # --- 4. Collect findings not already covered by an exception ------
+      def issue_cve(issue):
+          cves = issue.get('cves') or []
+          for c in cves:
+              cve = c.get('cve') if isinstance(c, dict) else c
+              if cve:
+                  return cve
+          return issue.get('cve')
+
+      findings = []
+      seen_findings = set()
+      for component in components_data:
+          component_id = component.get('general', {}).get('component_id')
+          for issue in component.get('issues', []):
+              cve = issue_cve(issue)
+              severity = issue.get('severity', 'Unknown')
+              identifier = cve or issue.get('issue_id') or issue.get('summary')
+              if cve and cve in ignored_cves:
+                  continue
+              key = (component_id, identifier)
+              if key in seen_findings:
+                  continue
+              seen_findings.add(key)
+              findings.append({
+                  'component': component_id,
+                  'cve': cve,
+                  'issue_id': issue.get('issue_id'),
+                  'severity': severity,
+                  'summary': issue.get('summary'),
+              })
+
+      blocking_findings = [f for f in findings if f['severity'] in BLOCKING_SEVERITIES]
+
+      with open('xray-results.json', 'w') as f:
+          json.dump({
+              'project_type': PROJECT_TYPE,
+              'manifest_path': MANIFEST_PATH,
+              'packages_checked': len(packages),
+              'components_returned': len(components_data),
+              'ignored_cve_count': len(ignored_cves),
+              'fail_on_vulnerabilities': FAIL_ON_VULNERABILITIES,
+              'blocking_severities': sorted(BLOCKING_SEVERITIES),
+              'findings': findings,
+              'blocking_findings_count': len(blocking_findings),
+              'raw_components': components_data,
+              'raw_ignore_rules': ignore_rules,
+          }, f, indent=2)
+
+      # --- 5. SARIF for the Azure DevOps Code Analysis Logs tab ----------
+      SEVERITY_TO_SARIF_LEVEL = {'Critical': 'error', 'High': 'error', 'Medium': 'warning', 'Low': 'note'}
+      rule_ids_seen = set()
+      rules = []
+      results = []
+      for finding in findings:
+          rule_id = finding['cve'] or finding['issue_id'] or 'XRAY-UNKNOWN'
+          if rule_id not in rule_ids_seen:
+              rule_ids_seen.add(rule_id)
+              rules.append({
+                  'id': rule_id,
+                  'name': rule_id,
+                  'shortDescription': {'text': (finding['summary'] or rule_id)[:200]},
+                  'helpUri': f"https://nvd.nist.gov/vuln/detail/{finding['cve']}" if finding['cve'] else '',
+              })
+          package_name = (finding['component'] or '').split(':')[0]
+          line = line_for_name.get(package_name, 1)
+          results.append({
+              'ruleId': rule_id,
+              'level': SEVERITY_TO_SARIF_LEVEL.get(finding['severity'], 'warning'),
+              'message': {'text': f"{finding['component']}: {finding['summary'] or rule_id} [{finding['severity']}]"},
+              'locations': [{
+                  'physicalLocation': {
+                      'artifactLocation': {'uri': MANIFEST_PATH},
+                      'region': {'startLine': line},
+                  },
+              }],
+          })
+
+      sarif = {
+          '$schema': 'https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json',
+          'version': '2.1.0',
+          'runs': [{
+              'tool': {'driver': {
+                  'name': 'JFrog Xray Component Search',
+                  'informationUri': 'https://jfrog.com/xray/',
+                  'version': '1.0.0',
+                  'rules': rules,
+              }},
+              'results': results,
+          }],
+      }
+      with open('xray.sarif', 'w') as f:
+          json.dump(sarif, f, indent=2)
+
+      # --- 6. Disclaimer / summary file ----------------------------------
+      severity_counts = {}
+      for finding in findings:
+          severity_counts[finding['severity']] = severity_counts.get(finding['severity'], 0) + 1
+
+      scan_time = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+      gate_desc = (
+          f"YES -- fails on {'/'.join(sorted(BLOCKING_SEVERITIES))} findings"
+          if FAIL_ON_VULNERABILITIES else "NO -- informational only"
+      )
+
+      lines = []
+      lines.append("JFrog Xray Vulnerability Scan -- Disclaimer & Summary")
+      lines.append("=" * 55)
+      lines.append(f"Repository     : {BUILD_REPO}")
+      lines.append(f"Scan date      : {scan_time}")
+      lines.append(f"Project type   : {PROJECT_TYPE} ({MANIFEST_PATH})")
+      lines.append(f"Watch          : {WATCH_NAME}")
+      lines.append(f"Gates build    : {gate_desc}")
+      lines.append("")
+      lines.append(
+          "This report is generated automatically by querying JFrog Xray's "
+          "vulnerability database for every package declared in the project "
+          "manifest above. It is provided for informational and internal "
+          "record-keeping purposes as part of routine supply-chain "
+          "transparency practice."
+      )
+      lines.append("")
+      lines.append(
+          'DISCLAIMER: This scan is provided "as is", without warranty of '
+          "any kind. No representation is made as to the completeness, "
+          "accuracy, or currency of the vulnerability data returned by "
+          "JFrog Xray. No liability is assumed for vulnerabilities "
+          "identified, vulnerabilities missed, or any consequence arising "
+          "from reliance on this report."
+      )
+      if not FAIL_ON_VULNERABILITIES:
+          lines.append(
+              "Findings below are surfaced for visibility only; this "
+              "pipeline step does not block or fail the build on them."
+          )
+      lines.append("")
+      lines.append("Summary:")
+      lines.append(f"  Packages checked           : {len(packages)}")
+      lines.append(f"  Known exceptions applied   : {len(ignored_cves)} CVE(s) (watch: {WATCH_NAME})")
+      lines.append(f"  Findings after exceptions  : {len(findings)}")
+      for sev in ('Critical', 'High', 'Medium', 'Low', 'Unknown'):
+          if sev in severity_counts:
+              lines.append(f"    {sev:<9}: {severity_counts[sev]}")
+      lines.append("")
+      if findings:
+          lines.append("Findings:")
+          for finding in findings:
+              ident = finding['cve'] or finding['issue_id'] or '(no id)'
+              lines.append(f"  - {finding['component']}  {ident}  [{finding['severity']}]")
+              if finding['summary']:
+                  lines.append(f"      {finding['summary'][:200]}")
+      else:
+          lines.append("No findings after applying known exceptions.")
+      lines.append("")
+      lines.append("Full machine-readable results: see the XrayResults pipeline artifact")
+      lines.append("(xray-results.json) and the SARIF file (published under CodeAnalysisLogs).")
+
+      with open('xray-disclaimer.txt', 'w') as f:
+          f.write('\n'.join(lines) + '\n')
+
+      print('\n'.join(lines))
+
+      if FAIL_ON_VULNERABILITIES and blocking_findings:
+          sys.exit(1)
+      PYEOF
+
+- task: PublishPipelineArtifact@1
+  displayName: Publish Xray Results
+  condition: always()
+  inputs:
+    targetPath: xray-results.json
+    artifactName: XrayResults
+
+- task: PublishPipelineArtifact@1
+  displayName: Publish SARIF Results
+  condition: always()
+  inputs:
+    targetPath: xray.sarif
+    artifactName: CodeAnalysisLogs
+
+- task: PublishPipelineArtifact@1
+  displayName: Publish Xray Disclaimer
+  condition: always()
+  inputs:
+    targetPath: xray-disclaimer.txt
+    artifactName: XrayDisclaimer
